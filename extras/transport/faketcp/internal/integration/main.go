@@ -310,8 +310,7 @@ func runClient(parent context.Context, o options) error {
 		}
 		s.Connections++
 		if o.traffic == "udp" {
-			s.Datagrams, s.Sent, err = transferUDP(ctx, c, until, o.udpPPS)
-			verified.Add(s.Datagrams * 1400)
+			s.Datagrams, s.Sent, err = transferUDP(ctx, c, until, o.udpPPS, &verified)
 		} else {
 			for batch := 0; time.Now().Before(until); batch++ {
 				var wg sync.WaitGroup
@@ -412,7 +411,7 @@ func udpPacing(pps int) (time.Duration, int) {
 	return interval, burst
 }
 
-func transferUDP(ctx context.Context, c client.Client, until time.Time, pps int) (uint64, uint64, error) {
+func transferUDP(ctx context.Context, c client.Client, until time.Time, pps int, verified *atomic.Uint64) (uint64, uint64, error) {
 	u, err := c.UDP()
 	if err != nil {
 		return 0, 0, err
@@ -439,6 +438,7 @@ func transferUDP(ctx context.Context, c client.Client, until time.Time, pps int)
 				}
 			}
 			received.Add(1)
+			verified.Add(uint64(len(p)))
 		}
 	}()
 	interval, burstSize := udpPacing(pps)

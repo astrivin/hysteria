@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"net"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/apernet/hysteria/core/v2/client"
 )
 
 func TestUDPPacing(t *testing.T) {
@@ -57,5 +63,95 @@ func TestUDPClientUsesRequestedSourcePort(t *testing.T) {
 	}
 	if !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("client did not reserve the requested source port: %v", err)
+	}
+}
+
+type udpProgressClient struct {
+	client.Client
+	conn *udpProgressConn
+}
+
+func (c udpProgressClient) UDP() (client.HyUDPConn, error) {
+	return c.conn, nil
+}
+
+type udpProgressConn struct {
+	packets chan []byte
+	closed  chan struct{}
+	once    sync.Once
+	corrupt bool
+}
+
+func (c *udpProgressConn) Send(p []byte, _ string) error {
+	p = bytes.Clone(p)
+	if c.corrupt {
+		p[8] ^= 1
+	}
+	select {
+	case c.packets <- p:
+		return nil
+	case <-c.closed:
+		return net.ErrClosed
+	}
+}
+
+func (c *udpProgressConn) Receive() ([]byte, string, error) {
+	select {
+	case p := <-c.packets:
+		return p, "echo:1234", nil
+	case <-c.closed:
+		return nil, "", net.ErrClosed
+	}
+}
+
+func (c *udpProgressConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestUDPProgressBeforeCompletion(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		name := "valid"
+		if corrupt {
+			name = "corrupt"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			conn := &udpProgressConn{packets: make(chan []byte, 8), closed: make(chan struct{}), corrupt: corrupt}
+			defer conn.Close()
+			var verified atomic.Uint64
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := transferUDP(ctx, udpProgressClient{conn: conn}, time.Now().Add(time.Minute), 100, &verified)
+				done <- err
+			}()
+			if corrupt {
+				err := <-done
+				if err == nil || err.Error() != "UDP payload corruption" {
+					t.Fatalf("corrupt payload was not rejected: %v", err)
+				}
+				if verified.Load() != 0 {
+					t.Fatal("corrupt payload was reported as verified progress")
+				}
+				return
+			}
+			for verified.Load() == 0 {
+				select {
+				case err := <-done:
+					t.Fatalf("transfer ended before reporting progress: %v", err)
+				case <-ctx.Done():
+					t.Fatal("no verified progress while UDP transfer was active")
+				case <-time.After(time.Millisecond):
+				}
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("progress was only reported after completion: %v", err)
+			default:
+			}
+			cancel()
+			<-done
+		})
 	}
 }
