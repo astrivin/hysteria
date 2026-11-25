@@ -1,5 +1,11 @@
 listen: :8443
 
+transport:
+  type: udp
+  faketcp:
+    mtu: 1400
+    idleTimeout: 3m
+
 realm:
   stunServers:
     - stun1.example.com:3478

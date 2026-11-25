@@ -131,8 +131,9 @@ type clientConfigTransportUDP struct {
 }
 
 type clientConfigTransport struct {
-	Type string                   `mapstructure:"type"`
-	UDP  clientConfigTransportUDP `mapstructure:"udp"`
+	Type    string                       `mapstructure:"type"`
+	UDP     clientConfigTransportUDP     `mapstructure:"udp"`
+	FakeTCP clientConfigTransportFakeTCP `mapstructure:"faketcp"`
 }
 
 type clientConfigObfsSalamander struct {
@@ -271,6 +272,9 @@ func (c *clientConfig) fillServerAddr(hyConfig *client.Config) error {
 // fillConnFactory must be called after fillServerAddr, since the right kind
 // of inner conn (plain vs port-hopping) depends on the resolved server addr.
 func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
+	if strings.EqualFold(c.Transport.Type, "faketcp") {
+		return c.fillFakeTCPConnFactory(hyConfig)
+	}
 	so, err := c.socketOptions()
 	if err != nil {
 		return err
@@ -448,6 +452,9 @@ func (c *clientConfig) validateMimic() error {
 	if !c.Mimic.Enabled {
 		return nil
 	}
+	if strings.EqualFold(c.Transport.Type, "faketcp") {
+		return configError{Field: "mimic", Err: errors.New("cannot be used with the faketcp transport")}
+	}
 	// Mimic matches traffic by a single ip:port. Port hopping moves the server
 	// port over a range, which would need one filter per port.
 	_, port, _ := parseServerAddrString(c.Server)
@@ -466,10 +473,15 @@ func (c *clientConfig) fillQUICConfig(hyConfig *client.Config) error {
 		MaxIdleTimeout:                 c.QUIC.MaxIdleTimeout,
 		KeepAlivePeriod:                c.QUIC.KeepAlivePeriod,
 		DisablePathMTUDiscovery:        c.QUIC.DisablePathMTUDiscovery,
-		DisableChromeParrot:            c.QUIC.DisableChromeParrot,
+		// Chrome parroting would override FakeTCP's 1200-byte initial packet
+		// with a 1250-byte packet, which is too large for some IPv6 paths.
+		DisableChromeParrot: c.QUIC.DisableChromeParrot || strings.EqualFold(c.Transport.Type, "faketcp"),
 		// Mimic rewrites packets after they leave the socket, which corrupts
 		// every segment but the first of a GSO batch.
-		DisableGSO: c.Mimic.Enabled,
+		DisableGSO: c.Mimic.Enabled || strings.EqualFold(c.Transport.Type, "faketcp"),
+	}
+	if strings.EqualFold(c.Transport.Type, "faketcp") {
+		hyConfig.QUICConfig.InitialPacketSize = 1200
 	}
 	return nil
 }
@@ -620,6 +632,9 @@ func (c *clientConfig) parseURI() bool {
 
 // Config validates the fields and returns a ready-to-use Hysteria client config
 func (c *clientConfig) Config() (*client.Config, error) {
+	if err := c.validateFakeTCP(); err != nil {
+		return nil, err
+	}
 	if realmAddr, ok, err := c.parseRealmAddr(); ok || err != nil {
 		if err != nil {
 			return nil, configError{Field: "server", Err: err}

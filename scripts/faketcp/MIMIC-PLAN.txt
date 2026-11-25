@@ -1,0 +1,372 @@
+原生 FakeTCP / mimic 安全隔离对照计划
+状态：源码审查形成的待执行方案。不是已经通过的性能或稳定性报告。
+
+适用环境与边界
+===============
+用户提供的 GCP x86 Debian（1 核 / 1 GiB）和 Oracle ARM Ubuntu（4 核 / 24 GiB）
+均有重要生产服务。本计划的所有普通文件、二进制、锁、日志必须放在
+/root/tmp/hy2；服务端口使用 6666，客户端源端口使用 6667。不会操作现有
+20000–50000 服务。两台主机的实际内核、功能、空闲资源尚未取得远程证据。
+
+主机地址和 SSH 密钥路径由操作者在本地环境提供，不写入仓库。
+执行顺序和验收状态管理以仓库根目录 FAKETCP_TESTING.md 为准。
+此文件不代表已经通过真实 Raw Socket、真实 GRO、mimic 或性能验收。
+
+本计划不加载或卸载内核模块、不安装系统软件、不修改全局 sysctl、物理网卡、
+生产防火墙、已有 TC/XDP 程序或已有服务。不运行 systemctl restart/reload、
+modprobe、insmod、rmmod、iptables -F、nft flush ruleset、pkill/killall。
+若必需网络功能未内建且未预先加载，不能借内核自动加载绕过这一边界。
+
+一、源码审查结论
+================
+1. app/internal/mimic 并不在 Go 中实现 mimic 数据面。mimic_linux.go 的 Start
+   启动外部 mimic CLI，生成服务端 local=IP:port,handshake=0:3 和客户端
+   remote=IP:port 过滤器，并等待 /run/mimic 的锁文件。
+
+2. 现有集成自动发现不能直接用于多个共享挂载空间的 netns 对照：
+   lockFiles() 使用 /run/mimic/*_<ifindex>.lock，只匹配 ifindex，忽略锁名中的
+   netns 标识。不同 netns 很容易都使用 ifindex=2，可能误认另一实例。
+   自动集成还硬编码 /run/mimic，与本次普通文件位置要求不一致。
+   本次无需修改产品代码：直接运行外部 mimic CLI，再使用 integration 的
+   -transport udp。这仍是同一个真实 Hysteria 核心经 mimic 的透明内核转换。
+
+3. 现有 extras/transport/faketcp/internal/integration/main.go 可作为共同负载：
+   UDP 与 FakeTCP 都设置 InitialPacketSize=1200、DisableChromeParrot=true、
+   DisableGSO=true，使用相同 TLS/认证、Brutal、内存 echo outbound 和验证代码。
+   当前已存在 -local-addr、-udp-pps 和 FAKETCP_TEST_AUTH，可限定端口与负载。
+   三组必须使用同一个源状态、Go 版本、编译参数和二进制 SHA256。
+
+4. 当前 scripts/test-faketcp-netns.sh 已加入外层私有 mount/network/PID
+   namespace、6666–7777 端口约束及可调负载，/run/netns 也落入私有
+   runtime 目录。它覆盖 UDP/native 功能矩阵，但没有 mimic 对照组；
+   CPU/内存仍需由调用方设置预算，生产机不能直接使用默认大负载。
+
+二、mimic 不加载模块的可行路径及限制
+===================================
+上游默认 CHECKSUM_HACK=kfunc 需要对应 mimic 模块提供 kfunc；关闭网卡
+offload 也不能让缺失的 kfunc 自动变为可加载。不要在生产机为测试装 DKMS。
+
+官方另支持 CHECKSUM_HACK=kprobe：模块不存在时 checksum hack 不生效，CLI
+会告警但仍可继续。上游文档明确，用户态 UDP socket 且不依赖 TX checksum
+offload 时，可以不需要该 hack。当前 integration 的 UDP 路径符合用户态
+UDP 前提；只在新建私有 veth 上关闭 TX checksum offload，三组保持一致。
+
+构建时指定 RUNTIME_DIR=/root/tmp/hy2/mimic-run。上游 get_lock_file_name()
+把 netns inode 与 ifindex 一起写入锁名；手动 CLI 没有 Hysteria 自动发现的
+跨 netns 匹配问题。当前 run.c 以程序/map fd 和锁内 ID 管理状态，正常路径
+没有要求向 /sys/fs/bpf pin 对象，不需要为本测试修改宿主 bpffs。
+
+重要：mimic run --check 不是只读预检。run.c 的 --check 判断发生在 XDP
+attach、TC attach、锁文件写入、过滤器设置之后。不要对生产物理接口运行它。
+即使在新建 veth 上使用，也应算一次真实的、有清理责任的测试部署。
+
+环境门槛：先核对实际内核及 BPF 功能；上游当前文档要求 Linux >= 6.1。
+如果 Oracle 的实际内核仍为 5.15，应记录此 mimic 版本不适用，不能升级
+内核或启用模块来完成本次对照。需要 BPF/TC/XDP 权限；netns 不会赋予缺失
+的宿主能力，也不会把内核模块隔离。
+
+预先核对 veth、sch_ingress、cls_bpf、所选防火墙后端等功能已经内建/加载；
+ip link add、TC attach、iptables/nft 操作本身也可能触发自动模块加载。
+内核配置和 /sys/module、/proc/modules 的读数不明时，停止在预检，不能尝试
+加载。不要设置 kernel.bpf_stats_enabled、unprivileged_bpf_disabled 等全局项。
+
+三、安全构建命令（待执行，不是已完成的构建记录）
+================================================
+优先在构建环境生成两个架构的二进制，校验后上传；不在 1 GiB GCP 上现场
+编译 Go/clang。若需要本机编译，也应仅在已具备依赖的获准环境中执行。
+固定审核过的 mimic commit，记录 git rev-parse HEAD，不用浮动 master 作
+最终结果的版本标识。普通文件全部置于指定目录。
+
+  B=/root/tmp/hy2
+  umask 077
+  mkdir -p "$B/mimic-run" "$B/results" "$B/tmp"
+  export TMPDIR="$B/tmp"
+
+  # 源码应已通过获准渠道放到此目录；本命令不安装任何软件或模块。
+  make -C "$B/mimic-src" -j1 build-cli \
+    MODE=release CHECKSUM_HACK=kprobe USE_LIBXDP=0 \
+    RUNTIME_DIR="$B/mimic-run"
+
+  git -C "$B/mimic-src" rev-parse HEAD
+  sha256sum "$B/mimic-src/out/mimic" "$B/faketcp-integration"
+  "$B/mimic-src/out/mimic" --version
+
+build-cli 只构建 CLI；不要使用默认 make/build，因为默认 build 还包含 kmod。
+所需 clang/BPF target、bpftool、libbpf、libffi、C 编译器/库应在构建环境
+预先准备。动态构建需核对目标架构、glibc、libbpf、libffi 兼容性；如使用
+STATIC=1，需要构建环境已有相应静态库，不能临时 apt install 到生产系统。
+若内核没有 BTF，NO_CORE=1 是上游提供的构建选择，必须记录并单独验证；
+不要把 verifier/load 失败算作 native 的性能优势。
+
+四、完全独立的本机 network namespace / veth
+==========================================
+采用 PID 持有的 network namespace，不调用 ip netns add，因此不需要普通
+文件/挂载点落入 /run/netns。每次运行使用新 holder PID。以下命令只有在
+依赖内建/已加载、权限与资源预检通过后才能执行。
+
+  unshare --net -- sleep 7200 &
+  SPID=$!
+  unshare --net -- sleep 7200 &
+  CPID=$!
+
+继续前必须检查：两个 holder 仍存活，/proc/$SPID/ns/net 与
+/proc/$CPID/ns/net 的 readlink 值均不同于 /proc/self/ns/net，且彼此不同。
+创建 namespace 有启动竞态，应有短的有界就绪等待；不得在校验失败后继续。
+
+  nsenter -t "$SPID" -n ip link add hy2s type veth peer name hy2c
+  nsenter -t "$SPID" -n ip link set hy2c netns "$CPID"
+  nsenter -t "$SPID" -n ip addr add 10.203.0.1/30 dev hy2s
+  nsenter -t "$CPID" -n ip addr add 10.203.0.2/30 dev hy2c
+  nsenter -t "$SPID" -n ip link set lo up
+  nsenter -t "$CPID" -n ip link set lo up
+  nsenter -t "$SPID" -n ip link set hy2s mtu 1500 up
+  nsenter -t "$CPID" -n ip link set hy2c mtu 1500 up
+
+  nsenter -t "$SPID" -n ethtool -K hy2s tx off gso off tso off gro off
+  nsenter -t "$CPID" -n ethtool -K hy2c tx off gso off tso off gro off
+  nsenter -t "$SPID" -n ethtool -k hy2s
+  nsenter -t "$CPID" -n ethtool -k hy2c
+
+核对实际 feature 值，不能仅根据 ethtool 返回码认定 offload 状态。
+本阶段没有默认路由、宿主转发、SNAT 或物理接口改变；报文只经过两个私有
+veth 端点。它测量本机真实内核路径，不代表两台云主机间 WAN 或物理 NIC。
+
+IPv6 后续功能用例可以在相同私有链接增加：
+  SPID: fd73:203::1/64，CPID: fd73:203::2/64（nodad），仍使用端口6666/6667。
+1280 MTU 只能设置这两个私有 veth，不能修改主机真实网卡。
+
+五、原生 FakeTCP 的 RST 规则只放在私有 namespace
+================================================
+以下 nft 命令以 nftables 已内建/加载且工具已存在为前提。不要为了执行它
+更换主机防火墙后端。规则在 output priority -300，早于 conntrack；只在
+native 用例安装，用例后删除本私有表。不要使用 INPUT DROP。
+
+  nsenter -t "$SPID" -n nft -f - <<'NFT'
+  table inet hy2ft {
+    chain rst {
+      type filter hook output priority -300; policy accept;
+      ip daddr 10.203.0.2 tcp sport 6666 tcp flags & rst == rst counter drop
+    }
+  }
+  NFT
+
+  nsenter -t "$CPID" -n nft -f - <<'NFT'
+  table inet hy2ft {
+    chain rst {
+      type filter hook output priority -300; policy accept;
+      ip daddr 10.203.0.1 tcp dport 6666 tcp flags & rst == rst counter drop
+    }
+  }
+  NFT
+
+IPv6 用例另加匹配 fd73:203::1/::2 的 ip6 规则。若只能使用已存在的 iptables
+后端，等价规则为私有 namespace 内的 -t raw OUTPUT、相同IP/端口与RST匹配。
+绝不能退回普通 filter/OUTPUT DROP：它可能在 conntrack 已变为 CLOSE 后
+才丢包。读取规则 counter 和本 namespace conntrack 状态验证实际生效。
+
+六、同一个负载程序的三组运行方式
+================================
+共同条件：相同二进制、证书/认证策略、Brutal带宽、负载类型、并发数、每次
+TCP载荷、持续时间、地址、端口、veth MTU/offload、CPU资源约束、日志等级。
+先使用 Host 关闭的 native 数据路径；Host 开启另列功能/启动开销用例。
+不要把现有生产官方hy2作为对照服务器，不修改它的配置。
+
+先在 /root/tmp/hy2 内准备独立随机测试认证文件，并把同一值通过环境变量
+FAKETCP_TEST_AUTH 传给本轮客户端/服务端。不要复用生产凭据，避免把认证值
+写入命令行或日志。可用以下方式读取既有测试认证文件：
+
+  IFS= read -r FAKETCP_TEST_AUTH < "$B/test-auth"
+  export FAKETCP_TEST_AUTH
+  H="$B/faketcp-integration"
+  M="$B/mimic-src/out/mimic"
+
+首次冒烟建议每方向 125000 bytes/s（1 Mbps），1 路流、64 KiB每次传输、
+10秒；UDP首次设置 -udp-pps 50。低负载通过后再评估是否存在资源余量。
+不得把当前 harness 的默认2路/100 Mbps/8000 UDP pps直接用于1核生产机。
+
+共同服务端命令模板，MODE 只能取 udp 或 faketcp：
+
+  nsenter -t "$SPID" -n nice -n 19 "$H" \
+    -role server -transport "$MODE" -address 10.203.0.1:6666 \
+    -mtu 1500 -bandwidth 125000 > "$B/results/$CASE-server.log" 2>&1 &
+  SERVER_PID=$!
+
+必须有界等待该进程仍存活且出现 READY，再运行客户端：
+
+  nsenter -t "$CPID" -n timeout --signal=TERM --kill-after=5s 50s \
+    nice -n 19 "$H" -role client -transport "$MODE" \
+    -address 10.203.0.1:6666 -local-addr 10.203.0.2:6667 \
+    -mtu 1500 -bandwidth 125000 -parallel 1 -size 65536 \
+    -traffic tcp -duration 10s \
+    > "$B/results/$CASE-client.json" 2> "$B/results/$CASE-client.log"
+
+每一组结束后 TERM并wait本组明确记录的 SERVER_PID。首轮负载进程可以统一
+GOMAXPROCS=1；如使用 GOMEMLIMIT，它只是GC软目标，不是硬内存隔离。
+
+A. UDP 基线：MODE=udp，无 mimic，没有 native RST 规则。
+B. native：MODE=faketcp，仅本私有 namespace 的 scoped RST 规则生效。
+C. mimic：MODE=udp，先在两端私有 veth 部署以下两个 CLI：
+
+  nsenter -t "$SPID" -n "$M" run hy2s --xdp-mode native \
+    -f 'local=10.203.0.1:6666,handshake=0:3' \
+    > "$B/results/mimic-server.log" 2>&1 &
+  MIMIC_SERVER_PID=$!
+  nsenter -t "$CPID" -n "$M" run hy2c --xdp-mode native \
+    -f 'remote=10.203.0.1:6666' \
+    > "$B/results/mimic-client.log" 2>&1 &
+  MIMIC_CLIENT_PID=$!
+
+先核对两端进程、成功部署日志/本 runtime 目录中的实例锁及 mimic show，
+再启动UDP服务/客户端。不要让未部署的mimic组悄悄退化为普通UDP却计作mimic。
+若私有veth native XDP不支持，记录失败；可另开全新case使用--xdp-mode skb，
+不能静默替换并与native模式混在同一结果中。mimic padding保持默认0并记录。
+
+结束时先停负载，再对这两个明确PID发TERM并wait，核对私有veth上的XDP/TC
+已detach，再进行下一组。即使CLI异常退出也只删除自己的私有veth/namespace，
+不尝试对生产接口执行任何清理。最终删除私有veth、TERM并wait两个holder。
+实际执行脚本应为上述明确PID设置EXIT/INT/TERM清理；不使用进程名批量杀进程。
+
+如需验证app的YAML配置接入，另开一个有界低负载冒烟。它与本对照共享同一
+生产源码，但不应把app启动模式、不同ChromeParrot/Initial/GSO默认值混入
+数据面性能比较。app自动mimic的/run/mimic路径/ifindex发现问题本次不修改。
+
+七、性能口径：能比较什么，不能推出什么
+=====================================
+1. integration 的 verified_payload_mbps 是客户端确认回显的有效载荷字节
+   除以完整运行时长；TCP业务同时经过上行与下行。不能将它直接称为单向
+   链路上限，也不能简单乘2作为独立全双工带宽。运行时长包含建连；若不
+   修改负载工具，应明确这个口径，用另一个短预热run与60秒正式run降低
+   启动扰动，但不能声称启动时间已从分母扣除。
+
+2. 以 UDP → native → mimic → mimic → native → UDP 顺序交错，至少3轮。
+   同一机器内比较传输差异；不能拿Oracle的native与GCP的mimic直接比较。
+   报告各轮原始结果、中位数和范围。相同目标速率都达标只证明该速率下
+   能承载负载，不能证明native已达到mimic的最大吞吐。
+
+3. 保持外层IP MTU相同，允许各自协议头开销的真实差异。native为TCP20+帧4，
+   mimic为把UDP8改成TCP20，即相对原UDP增加12字节；不应人为对齐到不同
+   物理MTU以掩盖开销。抓包/链路计数需包含实际线上字节及报文大小。
+
+4. 本方案的mimic是明确的CHECKSUM_HACK=kprobe、模块未加载、用户态UDP、
+   软件TX checksum、私有veth、指定XDP模式。结果不代表默认kfunc+模块+
+   物理NIC checksum offload组合的峰值性能。若模块本来已被生产环境加载，
+   不加载/卸载它，并把其“已存在且可能参与checksum路径”记录到结果，不能
+   仍标称无模块对照。
+
+5. 原始WAN路径、生产物理网卡native XDP、云QoS、跨云NAT是另一个测试维度。
+   不把mimic挂到承载SSH/现有hy2的物理接口来补做该维度；即使filter只匹配
+   6666，attach/detach、clsact及驱动行为仍涉及共享设备。在当前边界下若
+   没有独立接口/已获准隔离路径，则应报告该对照未执行。
+
+6. 1核生产机上无条件打满CPU或带宽与“不干扰现有服务”不相容。先保留
+   当前业务基线，使用低目标速率、限时与单并发；仅在观察到充分余量时
+   逐级提高。所有组使用相同的测试进程资源预算。内核softirq不一定完全
+   被用户进程CPU配额覆盖，nice或cgroup也不能承诺零影响。
+
+八、CPU、softirq、内存与丢包采集
+===============================
+读数和日志全部落在 /root/tmp/hy2/results。每个run之前/之后记录：
+  /proc/stat
+  /proc/softirqs
+  /proc/meminfo
+  /proc/pressure/cpu、/proc/pressure/memory（若可用）
+  所在测试cgroup的cpu.stat（若已有独立预算，记录throttling；不改生产cgroup）
+  每端 nsenter -n ip -s link show dev hy2s/hy2c
+  每端 nsenter -n ethtool -k hy2s/hy2c
+  每端 nsenter -n cat /proc/net/snmp /proc/net/netstat
+  每端相关 raw/UDP socket 的 ss -a -n -m -p 信息
+  mimic的版本/构建flags/运行模式、mimic show与私有TC/XDP状态
+
+如已安装pidstat，对本组明确PID采集 -u -r -w，间隔1秒；包括客户端、服务端
+及两端mimic。不要为了监控临时安装系统包。无pidstat时可采样/proc/PID/stat、
+status、smaps_rollup和cgroup cpu.stat。完整记录PID和采样区间。
+
+必须同时报告：
+  a. 应用进程 user/system CPU、RSS/PSS、线程和上下文切换；
+  b. 主机 /proc/stat 的 irq/softirq CPU时间增量及steal；
+  c. /proc/softirqs 中 NET_RX/NET_TX 次数增量；
+  d. 有效载荷、重传/丢包、socket/链路drops与测试cgroup节流。
+
+NET_RX/NET_TX计数不是CPU时间，不能拿次数代替softirq秒。mimic绝大部分
+数据转换发生在内核，mimic CLI本身CPU很低不等于总成本很低。也不要把
+进程system CPU直接加到已包含它的全机CPU增量中重复计费。全机增量含
+其他生产业务，只能结合邻近空载基线及重复轮次解释；业务噪声过大则
+不应给出精确CPU效率排名。BPF map/ringbuf的内核内存不在CLI RSS内。
+
+抓包使用少量、限时、明确接口与6666/6667过滤的pcap；吞吐正式run不长期
+全量抓包，尤其不能在1核机上把tcpdump开销当作传输差异。发送端checksum
+offload可导致抓包显示partial checksum，判定线上包错误应看接收端或当前
+明确关闭TX offload的私有链路。不要为采样开启全局bpf_stats_enabled。
+
+九、首次真实 Raw Socket 运行的优先验证点
+=======================================
+按顺序执行低负载，失败时保留已有证据，不用全局配置改变来“修好环境”。
+
+1. openSocket：TCP端口保留bind、CAP_NET_RAW、SO_ATTACH_FILTER、IPv4/IPv6
+   PMTU选项、IPv6 RECVPKTINFO 是否成功。遇到EPERM/EINVAL/ENOPROTOOPT，应
+   定位具体调用，不把启动失败直接归因到握手重传。
+
+2. RST/conntrack：确保私有output raw-priority规则counter确实命中；SYN、
+   SYN-ACK、ACK和业务包能通过INPUT到达AF_INET/AF_INET6 raw socket。
+   运行中观察TCP conntrack是否ESTABLISHED，不能只看短时间吞吐。
+
+3. 地址及checksum：显式绑定IP先成功，再测wildcard监听；捕获发送源IP、
+   TCP源端口和返回目的地址。IPv4依赖IP_PKTINFO.Spec_dst选择正确源IP；
+   IPv6依赖IPV6_PKTINFO及正确zone/ifindex，尤其应另测link-local。
+   所有这类核验先在私有链接进行，禁止用生产地址碰撞或接口变更测试。
+
+4. IPv4 raw recv含IP头而IPv6不含，内核BPF目标端口偏移因此不同；IPv6还
+   必须返回有效pktinfo。症状可能是“pcap有包但ReadFrom一直超时”，优先
+   区分BPF过滤、INPUT策略与ancillary-data，而不是放宽握手deadline。
+
+5. MTU：先1500，随后私有veth1280且QUIC Initial1200。确认超大写包变为
+   EMSGSIZE/丢失的PMTU探测，正常数据仍前进，并保留Brutal两包最低窗口。
+   报文不可被外层拆成任意TCP字节流片段。远端低MTU/ICMP黑洞属于独立
+   私有路由器用例，不能改宿主MTU或全局转发开关。
+
+6. GRO：软件checksum/GRO-off基线通过后，只在私有veth切GRO-on并记录
+   实际状态。开关“on”不证明发生聚合；结合接收包尺寸/受限诊断确认。
+   当前raw接收缓冲为65535字节，MSG_TRUNC/MSG_CTRUNC丢弃；BIG TCP/GRO
+   超64KiB不是已验证能力。不能宣称已覆盖所有硬件offload。
+
+7. 可中断性及资源：阻塞ReadFrom时Close/期限能否唤醒；同一6667源端口
+   重连；服务端测试进程重启；运行中socket queue/drop、FD、堆/内核内存
+   是否持续上升。所有启停只对本次明确PID，不能重启生产Hysteria。
+
+8. ARM64另外验证同一Raw代码路径，特别是ancillary数据布局与native-endian
+   ifindex读取。交叉编译或x86通过不能代替ARM64运行。
+
+十、出处与可复核路径
+====================
+复核源码：
+  app/internal/mimic/mimic.go
+  app/internal/mimic/mimic_linux.go: Start/runArgs/lockFiles/filtersFor
+  app/cmd/client.go: fillQUICConfig/startMimic
+  app/cmd/server.go: fillQUICConfig/runServer
+  extras/transport/faketcp/socket_linux.go
+  extras/transport/faketcp/addr.go
+  extras/transport/faketcp/packet.go
+  extras/transport/faketcp/internal/integration/main.go
+  scripts/test-faketcp-netns.sh
+
+本次通过官方仓库核对的mimic来源；最终实测需固定commit并记录差异：
+  https://github.com/hack3ric/mimic/blob/master/Makefile
+    CHECKSUM_HACK、RUNTIME_DIR、build-cli、STATIC、NO_CORE、USE_LIBXDP
+  https://github.com/hack3ric/mimic/blob/master/docs/checksum-hacks.md
+    模块可选条件、offload前提与平台要求
+  https://github.com/hack3ric/mimic/blob/master/docs/getting-started.md
+    Linux版本、TC/XDP路径、native/skb选择
+  https://github.com/hack3ric/mimic/blob/master/docs/mimic.1.md
+    CLI过滤器、握手参数与XDP选项
+  https://github.com/hack3ric/mimic/blob/master/src/run.c
+    run_bpf先attach后--check；kprobe无模块告警；正常退出detach
+  https://github.com/hack3ric/mimic/blob/master/src/main.c
+    get_lock_file_name包含netns inode与ifindex
+  https://github.com/hack3ric/mimic/blob/master/kmod/csum-hack.h
+    kfunc与kprobe两条checksum路径
+  https://github.com/hack3ric/mimic/blob/master/bpf/main.h
+    map/ringbuf内存不属于CLI RSS
+  https://github.com/hack3ric/mimic/blob/master/tests/bench.bash
+    上游自身使用netns/veth执行mimic的先例
+
+本文件是未执行的安全验收方案，不是性能报告或通过证明。

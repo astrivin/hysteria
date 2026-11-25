@@ -112,6 +112,7 @@ type TLSConfig struct {
 
 // QUICConfig contains the QUIC configuration fields that we want to expose to the user.
 type QUICConfig struct {
+	InitialPacketSize              uint16 // Zero uses QUIC's default; custom transports may need a smaller initial packet.
 	InitialStreamReceiveWindow     uint64
 	MaxStreamReceiveWindow         uint64
 	InitialConnectionReceiveWindow uint64

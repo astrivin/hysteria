@@ -52,6 +52,7 @@ func NewServer(config *Config) (Server, error) {
 	}
 	tlsConfig := convertToStdTLSConfig(config)
 	quicConfig := &quic.Config{
+		InitialPacketSize:              config.QUICConfig.InitialPacketSize,
 		InitialStreamReceiveWindow:     config.QUICConfig.InitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         config.QUICConfig.MaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: config.QUICConfig.InitialConnectionReceiveWindow,

@@ -21,6 +21,11 @@ transport:
     hopInterval: 30s
     minHopInterval: 10s
     maxHopInterval: 50s
+  faketcp:
+    localAddr: 192.0.2.1:30443
+    mtu: 1400
+    host: www.example.org
+    handshakeTimeout: 8s
 
 obfs:
   type: salamander

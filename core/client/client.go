@@ -81,6 +81,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		EncryptedClientHelloConfigList: c.config.TLSConfig.ECHConfigList,
 	}
 	quicConfig := &quic.Config{
+		InitialPacketSize:              c.config.QUICConfig.InitialPacketSize,
 		InitialStreamReceiveWindow:     c.config.QUICConfig.InitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         c.config.QUICConfig.MaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: c.config.QUICConfig.InitialConnectionReceiveWindow,

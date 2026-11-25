@@ -25,6 +25,13 @@ func TestServerConfig(t *testing.T) {
 	assertAllFieldsSet(t, config, "server")
 	assert.Equal(t, config, serverConfig{
 		Listen: ":8443",
+		Transport: serverConfigTransport{
+			Type: "udp",
+			FakeTCP: serverConfigTransportFakeTCP{
+				MTU:         1400,
+				IdleTimeout: 3 * time.Minute,
+			},
+		},
 		Realm: serverConfigRealm{
 			STUNServers:       []string{"stun1.example.com:3478", "stun2.example.com:3478"},
 			STUNTimeout:       6 * time.Second,

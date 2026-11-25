@@ -43,3 +43,62 @@ func TestBrutalLossCompensation(t *testing.T) {
 		})
 	}
 }
+
+type mockRTTStats struct {
+	congestion.RTTStatsProvider
+	rtt time.Duration
+}
+
+func (r *mockRTTStats) SmoothedRTT() time.Duration { return r.rtt }
+
+func TestBrutalMTUProbeDoesNotBlockData(t *testing.T) {
+	tests := []struct {
+		name string
+		size congestion.ByteCount
+	}{
+		{"minimum packet size", congestion.MinInitialPacketSize},
+		{"default packet size", congestion.InitialPacketSize},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := NewBrutalSender(5*1024*1024, false)
+			b.SetRTTStatsProvider(&mockRTTStats{rtt: time.Microsecond})
+			b.SetMaxDatagramSize(tt.size)
+			// MTU probes count toward bytes in flight but don't arm the PTO timer.
+			// A lost probe must leave room to send data that elicits an ACK.
+			probeSize := congestion.ByteCount(congestion.MaxPacketBufferSize)
+			if probeSize >= 2*tt.size {
+				t.Fatalf("maximum MTU probe %d no longer fits the two-packet window", probeSize)
+			}
+			if !b.CanSend(probeSize) {
+				t.Fatalf("MTU probe of %d bytes blocks data with window %d", probeSize, b.GetCongestionWindow())
+			}
+			if got := b.GetCongestionWindow(); got != 2*tt.size {
+				t.Fatalf("minimum congestion window = %d, want %d", got, 2*tt.size)
+			}
+		})
+	}
+}
+
+func TestBrutalCongestionWindowPreservesBandwidthDelayProduct(t *testing.T) {
+	tests := []struct {
+		name    string
+		rtt     time.Duration
+		ackRate float64
+		want    congestion.ByteCount
+	}{
+		{"unknown RTT", 0, 1, 10240},
+		{"regular RTT", 50 * time.Millisecond, 1, 100000},
+		{"loss compensation", 50 * time.Millisecond, 0.8, 125000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := NewBrutalSender(1000000, false)
+			b.SetRTTStatsProvider(&mockRTTStats{rtt: tt.rtt})
+			b.ackRate = tt.ackRate
+			if got := b.GetCongestionWindow(); got != tt.want {
+				t.Fatalf("congestion window = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

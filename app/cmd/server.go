@@ -74,6 +74,7 @@ func init() {
 type serverConfig struct {
 	Listen                string                      `mapstructure:"listen"`
 	Realm                 serverConfigRealm           `mapstructure:"realm"`
+	Transport             serverConfigTransport       `mapstructure:"transport"`
 	Obfs                  serverConfigObfs            `mapstructure:"obfs"`
 	TLS                   *serverConfigTLS            `mapstructure:"tls"`
 	ACME                  *serverConfigACME           `mapstructure:"acme"`
@@ -337,6 +338,13 @@ type serverConfigMasquerade struct {
 }
 
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
+	switch strings.ToLower(c.Transport.Type) {
+	case "", "udp":
+	case "faketcp":
+		return c.fillFakeTCPConn(hyConfig)
+	default:
+		return configError{Field: "transport.type", Err: errors.New("unsupported transport type")}
+	}
 	if realmAddr, ok, err := parseServerRealmAddr(c.Listen); ok || err != nil {
 		if err != nil {
 			return configError{Field: "listen", Err: err}
@@ -1214,7 +1222,10 @@ func (c *serverConfig) fillQUICConfig(hyConfig *server.Config) error {
 		DisablePathMTUDiscovery:        c.QUIC.DisablePathMTUDiscovery,
 		DisableStatelessReset:          c.QUIC.DisableStatelessReset,
 		// See the client side: Mimic and GSO are mutually exclusive.
-		DisableGSO: c.Mimic.Enabled,
+		DisableGSO: c.Mimic.Enabled || strings.EqualFold(c.Transport.Type, "faketcp"),
+	}
+	if strings.EqualFold(c.Transport.Type, "faketcp") {
+		hyConfig.QUICConfig.InitialPacketSize = 1200
 	}
 	return nil
 }
@@ -1699,6 +1710,12 @@ func (c *serverConfig) Config() (*server.Config, error) {
 	}
 	for _, f := range fillers {
 		if err := f(hyConfig); err != nil {
+			if hyConfig.Conn != nil {
+				_ = hyConfig.Conn.Close()
+			}
+			if hyConfig.Cleanup != nil {
+				_ = hyConfig.Cleanup.Close()
+			}
 			return nil, err
 		}
 	}

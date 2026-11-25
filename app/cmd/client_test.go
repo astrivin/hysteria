@@ -43,6 +43,12 @@ func TestClientConfig(t *testing.T) {
 				MinHopInterval: 10 * time.Second,
 				MaxHopInterval: 50 * time.Second,
 			},
+			FakeTCP: clientConfigTransportFakeTCP{
+				LocalAddr:        "192.0.2.1:30443",
+				MTU:              1400,
+				Host:             "www.example.org",
+				HandshakeTimeout: 8 * time.Second,
+			},
 		},
 		Obfs: clientConfigObfs{
 			Type: "salamander",

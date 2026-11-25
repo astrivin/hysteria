@@ -82,8 +82,9 @@ func (b *BrutalSender) GetCongestionWindow() congestion.ByteCount {
 		return 10240
 	}
 	cwnd := congestion.ByteCount(float64(b.bps) * rtt.Seconds() * congestionWindowMultiplier / b.ackRate)
-	if cwnd < b.maxDatagramSize {
-		cwnd = b.maxDatagramSize
+	// Leave room for data and its ACK when an oversized MTU probe remains in flight.
+	if cwnd < 2*b.maxDatagramSize {
+		cwnd = 2 * b.maxDatagramSize
 	}
 	return cwnd
 }
