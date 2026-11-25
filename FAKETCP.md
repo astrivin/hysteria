@@ -2,7 +2,7 @@
 
 本分支把 FakeTCP 直接接入 Hysteria 2 的 `net.PacketConn`：进程通过 Raw IP Socket 收发 TCP 格式的数据包，不经过本地 UDP 转发程序，也不需要 TUN、eBPF 或 mimic 的专用内核模块。QUIC 的 TLS、认证、数据可靠性和拥塞控制仍由原有 Hysteria 核心负责；外层不会再次重传业务数据或施加 TCP 拥塞控制。
 
-**当前仍是实验性候选，尚未完成真实 Raw Socket 链路、WSL2/Android 真机、长期高负载及 mimic 对照验收。** 开发环境没有运行这些测试所需的网络权限。测试程序、CI 工作流和交叉构建能力均不能代替实测；本文件不宣称已经达到 mimic 的性能，也不宣称已经满足所有稳定性验收条件。
+**当前仍是实验性候选。** Linux 两架构已完成报告所列的真实 Raw Socket、双向公网低负载及各61分钟观测；当前 CPU 配额限制了实际吞吐，尚未完成持续高负载、mimic 对照、硬件 offload 及 WSL2/Android 真机验收。精确提交、实际负载、socket 丢包、资源趋势和清理结果见 [实机测试报告](FAKETCP_TEST_RESULTS.md)。
 
 ## 兼容范围
 

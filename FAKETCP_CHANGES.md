@@ -1,6 +1,6 @@
 # 原生 FakeTCP 候选修改总结
 
-本文件记录 `faketcp` 分支相对基础提交 `7040c16752192e1ba72ee251005809a6bd9c9fd6` 的实现范围与开发验证结果。**这仍是实验性候选：尚未完成真实 Raw Socket 链路、WSL2/Android 真机、长期高负载和 mimic 性能对照验收。** 不能把构建成功、模拟测试或工作流存在解释为上述验收已通过。
+本文件记录 `faketcp` 分支相对基础提交 `7040c16752192e1ba72ee251005809a6bd9c9fd6` 的实现范围与历史开发验证结果。**这仍是实验性候选：尚未完成持续高负载、硬件 offload、WSL2/Android 真机及 mimic 性能对照验收。** 后续 Linux 两架构、双向公网低负载、各61分钟观测及清理实证见 [实机测试报告](FAKETCP_TEST_RESULTS.md)；构建、模拟和真实环境的结论按报告范围分别记录。
 
 配置与部署边界见 [FAKETCP.md](FAKETCP.md)，后续复测与本地 Codex 交接见 [FAKETCP_TESTING.md](FAKETCP_TESTING.md)。
 
@@ -111,6 +111,8 @@ HTTP Host 仅用于外层握手中的短 HTTP 前导，不改变实际服务器�
 两项跳过是需要额外权限的 `TestUDPPortRedirectIntegration`，以及未在该全量命令中开启的 `TestQUICBrutalShortSoak`；短 soak 已用独立命令执行，结果如上。后续应在正常测试环境对最终提交重新运行全量测试，并记录新结果，不能把这些历史原因当作未来失败的自动豁免。
 
 ## 6. 尚未完成与后续验收
+
+下文保留提交前开发环境的历史限制；后续已执行项目及仍受限范围以 [实机测试报告](FAKETCP_TEST_RESULTS.md) 为准。
 
 开发环境不具备实际 Raw Socket 链路测试所需权限。两个 Linux 目标的远端连接也未能建立 SSH，认证没有开始，因此没有远端配置变更或实机运行结果。
 
