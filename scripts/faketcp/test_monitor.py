@@ -17,7 +17,8 @@ class MonitorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
         self.work = Path(self.temp.name)
-        self.sleep = self.work / "test-sleeper"
+        # Multicall coreutils dispatches on argv[0], so preserve the applet name.
+        self.sleep = self.work / "sleep"
         shutil.copy2(shutil.which("sleep"), self.sleep)
         self.children = []
 

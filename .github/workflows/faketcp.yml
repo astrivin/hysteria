@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
@@ -42,8 +44,38 @@ jobs:
         run: |
           go install mvdan.cc/gofumpt@latest
           uv run python hyperbole.py format-check
-      - name: Existing tests
-        run: go test -count=1 -timeout=10m ./core/... ./extras/... ./app/...
+      - name: Baseline and candidate regressions
+        run: |
+          mkdir -p build
+          baseline="$RUNNER_TEMP/faketcp-baseline"
+          git worktree add --detach "$baseline" 7040c16752192e1ba72ee251005809a6bd9c9fd6
+          python_bin="$(python -c 'import sys; print(sys._base_executable)')"
+          (cd "$baseline" && uv sync --locked --python "$python_bin")
+          set +e
+          (cd "$baseline" && PATH="$baseline/.venv/bin:$PATH" go test -json -count=1 -timeout=10m ./core/... ./extras/... ./app/...) > build/baseline-tests.jsonl
+          baseline_status=$?
+          go test -json -count=1 -timeout=10m ./core/... ./extras/... ./app/... > build/candidate-tests.jsonl
+          candidate_status=$?
+          set -e
+          printf '%s\n' "$baseline_status" > build/baseline-tests.exit
+          printf '%s\n' "$candidate_status" > build/candidate-tests.exit
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import collections
+          import json
+          from pathlib import Path
+          print('| Source | Top-level PASS | FAIL | SKIP | Exit |')
+          print('| --- | ---: | ---: | ---: | ---: |')
+          for source in ('baseline', 'candidate'):
+              counts = collections.Counter()
+              for line in Path(f'build/{source}-tests.jsonl').read_text().splitlines():
+                  event = json.loads(line)
+                  if event.get('Test') and '/' not in event['Test'] and event['Action'] in ('pass', 'fail', 'skip'):
+                      counts[event['Action']] += 1
+              status = Path(f'build/{source}-tests.exit').read_text().strip()
+              print(f"| {source} | {counts['pass']} | {counts['fail']} | {counts['skip']} | {status} |")
+          PY
+          test "$baseline_status" -eq 0
+          test "$candidate_status" -eq 0
       - name: Validation tool checks
         run: |
           bash -n scripts/test-faketcp-netns.sh
@@ -51,15 +83,24 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python scripts/faketcp/test_monitor.py
       - name: FakeTCP race tests
         run: go test -race -count=1 -timeout=10m ./extras/transport/faketcp/...
+      - name: MTU, replay and fuzz regressions
+        run: |
+          go test -run TestQUICBrutalMTU1280 -count=10 -v ./extras/transport/faketcp
+          FAKETCP_SIM_SOAK=1m go test -run TestQUICBrutalShortSoak -count=1 -v ./extras/transport/faketcp
+          go test -run '^$' -fuzz FuzzParseSegmentAndFrames -fuzztime=20s -parallel=2 ./extras/transport/faketcp
       - name: FakeTCP benchmarks
         run: |
+          set -o pipefail
           mkdir -p build
           go test -run '^$' -bench . -benchmem ./extras/transport/faketcp | tee build/faketcp-benchmarks.txt
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: faketcp-unit-results-${{ github.sha }}
-          path: build/faketcp-benchmarks.txt
+          path: |
+            build/faketcp-benchmarks.txt
+            build/*-tests.jsonl
+            build/*-tests.exit
           if-no-files-found: ignore
 
   network:
@@ -83,6 +124,12 @@ jobs:
         run: |
           [[ "$SOAK_MINUTES" =~ ^[0-9]+$ ]] && (( SOAK_MINUTES >= 1 && SOAK_MINUTES <= 120 ))
           sudo env FAKETCP_SOAK_SECONDS="$((SOAK_MINUTES * 60))" FAKETCP_CASE_SECONDS=15 FAKETCP_CLIENTS=2 bash scripts/test-faketcp-netns.sh
+      - name: Make this job's network results readable
+        if: always()
+        run: |
+          if [[ -d build/faketcp-results ]]; then
+            sudo chown -hR -- "$(id -u):$(id -g)" build/faketcp-results
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
