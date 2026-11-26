@@ -1,5 +1,7 @@
 # Native FakeTCP validation — experimental candidate
 
+> Historical report for the v1 sources `81b1fb4` / `c14bce9`. The current v2 wire protocol changes production code and requires both endpoints to be upgraded. These older results are not v2 acceptance results. See [FAKETCP_FIXES.md](FAKETCP_FIXES.md) for the subsequent reconnect, session-isolation, control-write and GRO fixes and their validation scope.
+
 Both directions completed the recorded low-load minute tests and 61-minute stability runs, and final production/cleanup comparisons passed. This remains an experimental candidate: high-load capacity, parity with mimic, hardware-offload acceptance and WSL2/Android runtime acceptance are incomplete. The scope, observed socket drops and retained failures are recorded below.
 
 ## Source and artifacts

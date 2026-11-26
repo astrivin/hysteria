@@ -15,8 +15,12 @@ const (
 	defaultIdleTimeout      = 2 * time.Minute
 	tcpHeaderLen            = 20
 	frameHeaderLen          = 4
+	sessionIDLen            = 8
+	dataHeaderLen           = frameHeaderLen + sessionIDLen
 	maxPacketLen            = 65535
-	maxPeers                = 4096
+	// Linux GRO_MAX_SIZE is 8 * 65535, including BIG TCP aggregates.
+	maxReceivePacketLen = 512 * 1024
+	maxPeers            = 4096
 )
 
 // Config controls the outer transport, independently of QUIC's TLS settings.

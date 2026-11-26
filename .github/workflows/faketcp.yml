@@ -82,7 +82,7 @@ jobs:
           sh -n scripts/faketcp/preflight.sh
           PYTHONDONTWRITEBYTECODE=1 python scripts/faketcp/test_monitor.py
       - name: FakeTCP race tests
-        run: go test -race -count=1 -timeout=10m ./extras/transport/faketcp/...
+        run: go test -race -count=1 -timeout=10m ./core/client ./extras/transport/faketcp/...
       - name: MTU, replay and fuzz regressions
         run: |
           go test -run TestQUICBrutalMTU1280 -count=10 -v ./extras/transport/faketcp

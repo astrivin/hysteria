@@ -2,7 +2,9 @@
 
 本分支把 FakeTCP 直接接入 Hysteria 2 的 `net.PacketConn`：进程通过 Raw IP Socket 收发 TCP 格式的数据包，不经过本地 UDP 转发程序，也不需要 TUN、eBPF 或 mimic 的专用内核模块。QUIC 的 TLS、认证、数据可靠性和拥塞控制仍由原有 Hysteria 核心负责；外层不会再次重传业务数据或施加 TCP 拥塞控制。
 
-**当前仍是实验性候选。** Linux 两架构已完成报告所列的真实 Raw Socket、双向公网低负载及各61分钟观测；当前 CPU 配额限制了实际吞吐，尚未完成持续高负载、mimic 对照、硬件 offload 及 WSL2/Android 真机验收。精确提交、实际负载、socket 丢包、资源趋势和清理结果见 [实机测试报告](FAKETCP_TEST_RESULTS.md)。
+**当前仍是实验性候选。当前线协议为 v2，客户端和服务端必须一起更新，不能与 `c14bce9` 及更早的候选混用。** YAML 参数及防火墙规则不变。v2 为业务帧增加会话标识，修复旧连接迟到数据影响新连接 ACK 的问题；同时修复休眠恢复后的端口预留泄漏、读路径控制回复阻塞，并允许软件 GRO 聚合。修复说明、验证边界及简短复测步骤见 [FAKETCP_FIXES.md](FAKETCP_FIXES.md)。
+
+Linux 两架构的旧候选已完成报告所列的真实 Raw Socket、双向公网低负载及各61分钟观测；用户也已在 WSL2 和 Android 运行旧候选，并报告休眠恢复缺陷。旧版本测试不能替代修复版本的设备恢复验收。持续高负载、mimic 对照与硬件 offload 仍未完成；历史证据见 [实机测试报告](FAKETCP_TEST_RESULTS.md)。
 
 ## 兼容范围
 
@@ -134,12 +136,13 @@ sudo iptables -t raw -D OUTPUT -p tcp -d 198.51.100.10 --dport 443 --tcp-flags R
 
 ## MTU、GRO 与 QUIC
 
-业务包的外层开销为：IPv4 头 20 字节或 IPv6 头 40 字节，加 TCP 头 20 字节，加数据报帧头 4 字节。此处不计算握手 SYN 选项或额外的网络隧道开销。
+业务包的外层开销为：IPv4 头 20 字节或 IPv6 头 40 字节，加 TCP 头 20 字节，加长度帧头 4 字节和会话标识 8 字节。v2 每个数据报比旧候选增加 8 字节，不增加逐包加密或 HMAC。此处不计算握手 SYN 选项或额外的网络隧道开销。
 
 | 外层 MTU | IPv4 可承载的 QUIC 数据报 | IPv6 可承载的 QUIC 数据报 |
 | --- | --- | --- |
-| 1500 | 1456 字节 | 1436 字节 |
-| 1280 | 1236 字节 | 1216 字节 |
+| 1500 | 1448 字节 | 1428 字节 |
+| 1400 | 1348 字节 | 1328 字节 |
+| 1280 | 1228 字节 | 1208 字节 |
 
 `mtu` 是该端的发送上限，建议两端使用适合实际路径的值。代码要求至少 1280，发送超过预算时返回 `EMSGSIZE`，并启用禁止 IP 分片的路径 MTU 设置，不会把一个业务数据报拆成多个外层 TCP 段。
 
@@ -147,7 +150,9 @@ FakeTCP 双方从 **1200 字节 QUIC 初始包**开始，后续继续由 QUIC �
 
 Brutal 保留目标速率、发送节奏和丢包补偿；本分支将其**最小拥塞窗口由一包修正为两包**，防止极低 RTT 时单个丢失的 MTU 探测包占满窗口，导致后续数据无法发送、缺少新的 ACK 来完成探测判丢。该修正也适用于普通 UDP 的低带宽延迟积路径。[RFC 9002 §4.8](https://www.rfc-editor.org/rfc/rfc9002#section-4.8) 同样建议 QUIC 使用两包的最小拥塞窗口。[Brutal 回归测试](core/internal/congestion/brutal/brutal_test.go) 覆盖探测包之后仍能发送数据，并检查原有未知 RTT、常规带宽延迟积及丢包补偿计算；[真实 QUIC 模拟链路测试](extras/transport/faketcp/quic_test.go) 覆盖 MTU 1280 下的双栈、有故障与无故障传输。
 
-每个数据报包含长度帧头，接收端能够拆分 GRO 将多个完整发送段合并后的负载，不需要把关闭 GRO 作为协议运行前提。格式非法或截断的帧会丢弃，业务数据完整性仍由 QUIC 校验。**这是实现机制，不是已经通过所有网卡、驱动或硬件 GRO 测试的结论。** 实际 GRO 开关、低 MTU、丢包和乱序验证由后文脚本提供；中间设备任意重分段或代理 TCP 字节流不在协议支持范围内。
+每个数据报包含长度帧头和会话标识，接收端逐帧校验当前会话后才更新外层 ACK 和活动时间。普通数据段不再设置 PSH，避免每包强制刷新 Linux 软件 GRO；握手前导仍保留 PSH。接收缓冲区为每个 PacketConn 512 KiB，覆盖 Linux 的 `GRO_MAX_SIZE = 8 * 65535`，并识别 IPv4 BIG TCP 的零 total-length 表示。发送 MTU 上限仍为 65535，不发送 IP jumbo 包，也不修改网卡或系统 offload 设置。
+
+格式非法、会话不匹配或截断的帧会丢弃，业务数据完整性仍由 QUIC 校验。**这些机制和合成聚合回归不代表已经完成所有网卡、驱动或硬件 GRO 验收，也不保证实际链路一定发生聚合。** 实际 GRO 开关、低 MTU、丢包和乱序验证由后文脚本提供；中间设备任意重分段或代理 TCP 字节流不在协议支持范围内。Linux 定义见 [GRO_MAX_SIZE](https://github.com/torvalds/linux/blob/v6.12/include/linux/netdevice.h#L2247-L2251) 与 [IPv4 BIG TCP 长度](https://github.com/torvalds/linux/blob/v6.12/include/linux/ip.h#L52-L58)。
 
 ## 当前限制
 

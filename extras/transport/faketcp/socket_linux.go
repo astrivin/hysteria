@@ -184,6 +184,11 @@ func (s *rawSocket) ReadPacket(b []byte) ([]byte, netip.Addr, netip.Addr, error)
 			}
 			h := int(b[0]&15) * 4
 			size := int(binary.BigEndian.Uint16(b[2:4]))
+			// IPv4 BIG TCP uses a zero total length for a GRO aggregate that
+			// exceeds the on-wire IP size limit. Recvmsg supplies its full size.
+			if size == 0 && n > maxPacketLen {
+				size = n
+			}
 			if h < 20 || h > n || size < h || size > n || b[9] != unix.IPPROTO_TCP {
 				continue
 			}
@@ -253,22 +258,36 @@ func (s *rawSocket) Writer(local, remote netip.AddrPort) (packetWriter, error) {
 func (w *rawWriter) WritePacket(b []byte) error {
 	var sendErr error
 	err := w.socket.raw.Write(func(fd uintptr) bool {
-		for {
-			n, err := unix.SendmsgN(int(fd), b, w.oob, w.addr, unix.MSG_DONTWAIT)
-			sendErr = err
-			if err == unix.EINTR {
-				continue
-			}
-			if err == nil && n != len(b) {
-				sendErr = errors.New("short raw TCP write")
-			}
-			return err != unix.EAGAIN && err != unix.EWOULDBLOCK
-		}
+		sendErr = w.send(fd, b)
+		return sendErr != unix.EAGAIN && sendErr != unix.EWOULDBLOCK
 	})
 	if err != nil {
 		return err
 	}
 	return sendErr
+}
+
+func (w *rawWriter) TryWritePacket(b []byte) error {
+	var sendErr error
+	// Control does not take the poller's write lock or wait for writability.
+	err := w.socket.raw.Control(func(fd uintptr) { sendErr = w.send(fd, b) })
+	if err != nil {
+		return err
+	}
+	return sendErr
+}
+
+func (w *rawWriter) send(fd uintptr, b []byte) error {
+	for {
+		n, err := unix.SendmsgN(int(fd), b, w.oob, w.addr, unix.MSG_DONTWAIT)
+		if err == unix.EINTR {
+			continue
+		}
+		if err == nil && n != len(b) {
+			return errors.New("short raw TCP write")
+		}
+		return err
+	}
 }
 
 func (s *rawSocket) Close() error {

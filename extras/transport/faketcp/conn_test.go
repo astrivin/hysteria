@@ -2,6 +2,7 @@ package faketcp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -113,8 +114,9 @@ func (s *simSocket) SetDeadline(t time.Time) error {
 	_ = s.SetReadDeadline(t)
 	return s.SetWriteDeadline(t)
 }
-func (s *simSocket) SetReadBuffer(int) error  { return nil }
-func (s *simSocket) SetWriteBuffer(int) error { return nil }
+func (s *simSocket) SetReadBuffer(int) error       { return nil }
+func (s *simSocket) SetWriteBuffer(int) error      { return nil }
+func (w *simWriter) TryWritePacket(b []byte) error { return w.WritePacket(b) }
 func (w *simWriter) WritePacket(b []byte) error {
 	select {
 	case <-w.socket.done:
@@ -256,10 +258,10 @@ func TestHandshakeLossAndDuplicates(t *testing.T) {
 					case len(seg.payload) == 0 && src == c.client.key.local:
 						kind = "ack"
 					default:
-						if _, ok := parseHello(seg.payload); ok {
+						if _, _, ok := parseHello(seg.payload); ok {
 							kind = "hello"
 						}
-						if isWelcome(seg.payload, host != "") {
+						if _, ok := parseWelcome(seg.payload, host != "", c.client.nonce); ok {
 							kind = "welcome"
 						}
 					}
@@ -323,7 +325,7 @@ func TestDatagramLossReorderDuplicateGRO(t *testing.T) {
 		if src != c.client.key.local || !ok || kind != frameData {
 			return [][]byte{b}
 		}
-		switch payload[0] {
+		switch payload[sessionIDLen] {
 		case 1:
 			reorder = b
 			return nil
@@ -369,7 +371,7 @@ func TestMTUWriteFailureAndSequenceWrap(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := c.client.sendSeq
-			limit := 1280 - ipHeaderLen(c.remote.Addr()) - tcpHeaderLen - frameHeaderLen
+			limit := 1280 - ipHeaderLen(c.remote.Addr()) - tcpHeaderLen - dataHeaderLen
 			n, err := c.WriteTo(make([]byte, limit+1), net.UDPAddrFromAddrPort(c.remote))
 			if n != 0 || !errors.Is(err, syscall.EMSGSIZE) || c.client.sendSeq != before {
 				t.Fatalf("oversize consumed sequence: n=%d err=%v", n, err)
@@ -394,7 +396,7 @@ func TestMTUWriteFailureAndSequenceWrap(t *testing.T) {
 			}
 			p.recvNext.Store(^uint32(0) - 10)
 			roundTrip(t, c, []byte("wrap"))
-			if c.client.sendSeq != 5 || p.recvNext.Load() != 5 {
+			if c.client.sendSeq != 13 || p.recvNext.Load() != 13 {
 				t.Fatalf("bad wrap: seq=%d ack=%d", c.client.sendSeq, p.recvNext.Load())
 			}
 			old := p.recvNext.Load()
@@ -486,8 +488,9 @@ func TestCookieValidationAndExpiry(t *testing.T) {
 	key := peerKey{netip.MustParseAddrPort("192.0.2.2:443"), netip.MustParseAddrPort("192.0.2.1:30000")}
 	seq := uint32(12345)
 	minute := time.Now().Unix() / 60
+	hello := helloPayload("", 12345)
 	for _, cookie := range []uint32{s.cookie(key, seq, minute, nil) ^ 0x80000000, s.cookie(key, seq, minute-2, nil)} {
-		_, err := s.accept(segment{seq: seq + 1, ack: cookie + 1, flags: flagACK}, key)
+		_, err := s.accept(segment{seq: seq + 1, ack: cookie + 1, flags: flagACK, payload: hello}, key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -496,6 +499,10 @@ func TestCookieValidationAndExpiry(t *testing.T) {
 		}
 	}
 	_, err := s.accept(segment{seq: seq + 1, ack: s.cookie(key, seq, minute, nil) + 1, flags: flagACK}, key)
+	if err != nil || len(s.peers) != 0 {
+		t.Fatalf("bare ACK allocated peer: err=%v", err)
+	}
+	_, err = s.accept(segment{seq: seq + 1, ack: s.cookie(key, seq, minute, nil) + 1, flags: flagACK, payload: hello}, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +628,7 @@ func TestLateHelloDoesNotUndoReconnect(t *testing.T) {
 			network.filter = func(src, dst netip.AddrPort, b []byte) [][]byte {
 				seg, _ := parseSegment(b)
 				if src == c.client.key.local {
-					if _, ok := parseHello(seg.payload); ok {
+					if _, _, ok := parseHello(seg.payload); ok {
 						hellos[seg.seq-1] = bytes.Clone(b)
 					}
 				} else if seg.flags&(flagSYN|flagACK) == flagSYN|flagACK {
@@ -700,7 +707,7 @@ func TestHandshakeRefreshesCookieAfterCompetingHandshake(t *testing.T) {
 			defer next.Close()
 			next.client.initialSeq, next.client.sendSeq = 20000, 20001
 			const competingISN = 30000
-			hello := helloPayload(host)
+			hello := helloPayload(host, 987654321)
 			var heldHello []byte
 			var cookies []uint32
 			competingReady := false
@@ -713,7 +720,7 @@ func TestHandshakeRefreshesCookieAfterCompetingHandshake(t *testing.T) {
 			network.filter = func(src, dst netip.AddrPort, b []byte) [][]byte {
 				seg, _ := parseSegment(b)
 				if src == next.client.key.local {
-					if _, ok := parseHello(seg.payload); ok && heldHello == nil {
+					if _, _, ok := parseHello(seg.payload); ok && heldHello == nil {
 						// Hold B's hello while a competing C handshake changes
 						// the server generation. Neither state machine is mocked.
 						heldHello = bytes.Clone(b)
@@ -728,7 +735,7 @@ func TestHandshakeRefreshesCookieAfterCompetingHandshake(t *testing.T) {
 					if seg.ack == next.client.initialSeq+1 {
 						cookies = append(cookies, seg.seq)
 					}
-				} else if seg.ack == competingISN+1+uint32(len(hello)) && isWelcome(seg.payload, host != "") {
+				} else if _, ok := parseWelcome(seg.payload, host != "", 987654321); seg.ack == competingISN+1+uint32(len(hello)) && ok {
 					competingReady = true
 					// Deliver B's stale hello only after C has been accepted.
 					s.io.(*simSocket).queue <- simPacket{next.client.key.local.Addr(), next.remote.Addr(), bytes.Clone(heldHello)}
@@ -757,7 +764,8 @@ func TestHandshakeRefreshesCookieAfterCompetingHandshake(t *testing.T) {
 
 func TestDeadlineWithPendingGRO(t *testing.T) {
 	c, _, _ := simPair(t, "", false)
-	c.pending = append([]byte{frameMagic, frameData, 0, 1}, 7)
+	payload := binary.BigEndian.AppendUint64(nil, c.client.session)
+	c.pending = makeTestFrame(frameData, append(payload, 7))
 	c.pendingPeer = c.client
 	_ = c.SetReadDeadline(time.Now().Add(-time.Second))
 	b := make([]byte, 4)

@@ -12,7 +12,7 @@ const (
 	flagRST      = 0x04
 	flagPSH      = 0x08
 	flagACK      = 0x10
-	frameMagic   = 0x48
+	frameMagic   = 0x49 // v2: data records carry a handshake-bound session ID.
 	frameHello   = 1
 	frameWelcome = 2
 	frameData    = 3
@@ -133,46 +133,54 @@ func nextFrame(b []byte) (kind byte, payload, rest []byte, ok bool) {
 	return b[1], b[frameHeaderLen : frameHeaderLen+n], b[frameHeaderLen+n:], true
 }
 
-func helloPayload(host string) []byte {
+func helloPayload(host string, nonce uint64) []byte {
 	var b []byte
 	if host != "" {
 		b = []byte("GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: keep-alive\r\n\r\n")
 	}
-	b = append(b, frameMagic, frameHello, 0, 0)
-	return b
+	b = append(b, frameMagic, frameHello, 0, 8)
+	return binary.BigEndian.AppendUint64(b, nonce)
 }
 
-func parseHello(b []byte) (http, ok bool) {
+func parseHello(b []byte) (nonce uint64, http, ok bool) {
 	if bytes.HasPrefix(b, httpRequestStart) {
 		if len(b) > 512 {
-			return false, false
+			return 0, false, false
 		}
 		i := bytes.Index(b, headerEnd)
 		if i < 0 {
-			return false, false
+			return 0, false, false
 		}
 		b = b[i+len(headerEnd):]
 		http = true
 	}
 	kind, payload, rest, valid := nextFrame(b)
-	return http, valid && kind == frameHello && len(payload) == 0 && len(rest) == 0
+	if !valid || kind != frameHello || len(payload) != 8 || len(rest) != 0 {
+		return 0, false, false
+	}
+	return binary.BigEndian.Uint64(payload), http, true
 }
 
-func welcomePayload(http bool) []byte {
+func welcomePayload(http bool, nonce, session uint64) []byte {
 	var b []byte
 	if http {
 		b = append(b, httpResponse...)
 	}
-	return append(b, frameMagic, frameWelcome, 0, 0)
+	b = append(b, frameMagic, frameWelcome, 0, 16)
+	b = binary.BigEndian.AppendUint64(b, nonce)
+	return binary.BigEndian.AppendUint64(b, session)
 }
 
-func isWelcome(b []byte, http bool) bool {
+func parseWelcome(b []byte, http bool, nonce uint64) (session uint64, ok bool) {
 	if http {
 		if !bytes.HasPrefix(b, httpResponse) {
-			return false
+			return 0, false
 		}
 		b = b[len(httpResponse):]
 	}
 	kind, payload, rest, ok := nextFrame(b)
-	return ok && kind == frameWelcome && len(payload) == 0 && len(rest) == 0
+	if !ok || kind != frameWelcome || len(payload) != 16 || len(rest) != 0 || binary.BigEndian.Uint64(payload) != nonce {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(payload[8:]), true
 }

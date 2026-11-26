@@ -1,6 +1,6 @@
 # 原生 FakeTCP 候选修改总结
 
-本文件记录 `faketcp` 分支相对基础提交 `7040c16752192e1ba72ee251005809a6bd9c9fd6` 的实现范围与历史开发验证结果。**这仍是实验性候选：尚未完成持续高负载、硬件 offload、WSL2/Android 真机及 mimic 性能对照验收。** 后续 Linux 两架构、双向公网低负载、各61分钟观测及清理实证见 [实机测试报告](FAKETCP_TEST_RESULTS.md)；构建、模拟和真实环境的结论按报告范围分别记录。
+本文件记录 `faketcp` 分支相对基础提交 `7040c16752192e1ba72ee251005809a6bd9c9fd6` 的实现范围与历史开发验证结果。**这仍是实验性候选：尚未完成持续高负载、硬件 offload 及 mimic 性能对照验收。** 用户已在 WSL2/Android 使用旧候选并报告休眠恢复问题；当前 v2 修复及其针对性验收见 [FAKETCP_FIXES.md](FAKETCP_FIXES.md)。Linux 两架构旧候选的双向公网低负载、各61分钟观测及清理实证见 [实机测试报告](FAKETCP_TEST_RESULTS.md)，不能直接视为 v2 已通过这些测试。
 
 配置与部署边界见 [FAKETCP.md](FAKETCP.md)，后续复测与本地 Codex 交接见 [FAKETCP_TESTING.md](FAKETCP_TESTING.md)。
 
@@ -23,15 +23,16 @@
 - Linux 后端使用 `AF_INET`/`AF_INET6` Raw IP Socket，自行生成 TCP 头与校验和；普通未连接的 TCP socket 仅用于保留本地端口。
 - 使用经典 socket BPF 过滤目标端口，减少无关包进入用户态；不使用 eBPF、TC/XDP、TUN 或专用内核模块。程序不会修改防火墙或加载模块。
 - 实现外层 SYN/SYN-ACK/ACK 和协议前导交换，包括握手重试、重复报文处理、SYN cookie 校验、同四元组重连、服务端状态过期与回收；服务端状态上限为 4096 个对端。
-- 重连用的 SYN cookie 绑定当前连接的双方初始序号，防止 A→B→C 重连后，仍在时间窗内的旧 A/B hello 把服务端切回旧连接。当前连接的重复 SYN 复用同一 cookie，客户端每轮重试重新发送 SYN，以便竞争握手改变 cookie 后仍能完成握手；这些运算只在控制面，不增加数据包热路径的 HMAC。
-- 数据报有 4 字节长度帧头，接收端可从一个合并负载中取出多个完整数据报；包含非法长度、截断帧、序号回绕、乱序/丢包/重复、并发关闭与 deadline 的测试。
+- 重连用的 SYN cookie 绑定当前连接的双方初始序号及会话标识，防止旧 hello 把服务端切回旧连接。v2 hello 携带客户端随机 nonce，welcome 回显 nonce 并分配服务端随机会话 ID；同 ISN 的新客户端也须完成绑定当前代际的 cookie 挑战。控制面回复使用非阻塞发送，客户端重试恢复丢弃的回复；不增加后台队列或每 peer goroutine。
+- v2 数据报有 4 字节长度帧头及 8 字节会话标识。接收端逐帧校验会话后才更新 ACK/活动时间，继续允许合法乱序、重复与序号回绕。普通数据段不带 PSH，接收端支持有界的 BIG TCP 聚合；业务数据校验仍由 QUIC 负责。
+- `core/client/reconnect.go` 在连接关闭错误后先关闭旧客户端再清空引用，释放其 PacketConn 和本地端口。清理保持在现有重连锁内，旧请求的迟到错误不会关闭新代连接；普通 UDP 也获得此资源清理修复。
 - 对多本地地址监听保留实际目的 IP，使服务端回复使用正确源地址。发送缓冲区与编解码逻辑集中在新包内，未引入通用包编码器或新的第三方传输依赖。
 
 这是新的线协议，两端都必须使用本实现；不能与 Hysteria 1 FakeTCP、udp2raw、Phantun、mimic 或普通 TCP 服务互通。严格状态检查、NAT、网络切换及实际网卡 offload 的兼容性仍须实测。
 
 ### MTU、GRO 与 QUIC 接入
 
-配置的 MTU 表示完整外层 IP 包的发送上限。数据包开销为 IPv4 20 字节或 IPv6 40 字节，加 TCP 20 字节和帧头 4 字节；MTU 1280 时分别最多承载 1236 或 1216 字节 QUIC 数据报。超过配置预算的发送返回包装后的 `EMSGSIZE`，并使用禁止 IP 分片的路径 MTU 设置。
+配置的 MTU 表示完整外层 IP 包的发送上限。v2 数据包开销为 IPv4 20 字节或 IPv6 40 字节，加 TCP 20 字节、帧头 4 字节及会话标识 8 字节；MTU 1280 时分别最多承载 1228 或 1208 字节 QUIC 数据报。超过配置预算的发送返回包装后的 `EMSGSIZE`，并使用禁止 IP 分片的路径 MTU 设置。
 
 FakeTCP 双端固定从 1200 字节 QUIC 初始包开始，随后继续使用 DPLPMTUD。这样避免初始包在远端 IPv6 1280 MTU 瓶颈上过大而黑洞，不能只依赖本地接口 MTU 或即时 `EMSGSIZE`。FakeTCP 客户端自动禁用会覆盖初始包大小的 ChromeParrot，双端禁用 UDP GSO；原有 UDP 的这些配置默认值不变。
 

@@ -144,11 +144,12 @@ func TestPacketMTUBoundaries(t *testing.T) {
 		local := netip.MustParseAddrPort(family.address)
 		for _, mtu := range []int{1280, 1500, 9000, 65535} {
 			t.Run(fmt.Sprintf("%s/%d", local.Addr(), mtu), func(t *testing.T) {
-				size := mtu - family.ipLength - 20 - 4
-				frame := make([]byte, size+4)
-				putFrameHeader(frame, frameData, size)
-				for i := range frame[4:] {
-					frame[i+4] = byte(i)
+				size := mtu - family.ipLength - tcpHeaderLen - dataHeaderLen
+				frame := make([]byte, size+dataHeaderLen)
+				putFrameHeader(frame, frameData, sessionIDLen+size)
+				binary.BigEndian.PutUint64(frame[frameHeaderLen:], 12345)
+				for i := range frame[dataHeaderLen:] {
+					frame[i+dataHeaderLen] = byte(i)
 				}
 				buf := make([]byte, mtu)
 				n := marshalSegment(buf, local, local, 0xffffffff, 0, flagACK|flagPSH, frame, mtu)
@@ -163,7 +164,7 @@ func TestPacketMTUBoundaries(t *testing.T) {
 					t.Fatal("could not parse MTU-sized packet")
 				}
 				kind, p, rest, ok := nextFrame(s.payload)
-				if !ok || kind != frameData || len(p) != size || len(rest) != 0 || !bytes.Equal(p, frame[4:]) {
+				if !ok || kind != frameData || len(p) != sessionIDLen+size || len(rest) != 0 || !bytes.Equal(p, frame[frameHeaderLen:]) {
 					t.Fatalf("MTU-sized datagram did not survive framing (payload=%d)", size)
 				}
 			})
@@ -281,10 +282,11 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestHTTPPreface(t *testing.T) {
+	const nonce, session = uint64(0x1020304050607080), uint64(0x8877665544332211)
 	for _, host := range []string{"", "camouflage.example", "www.example.com:8080", "[2001:db8::1]", strings.Repeat("a", 253)} {
-		request := helloPayload(host)
-		isHTTP, ok := parseHello(request)
-		if !ok || isHTTP != (host != "") {
+		request := helloPayload(host, nonce)
+		gotNonce, isHTTP, ok := parseHello(request)
+		if !ok || gotNonce != nonce || isHTTP != (host != "") {
 			t.Fatalf("Host %q did not round trip", host)
 		}
 		if host != "" {
@@ -292,39 +294,42 @@ func TestHTTPPreface(t *testing.T) {
 				t.Fatalf("HTTP Host not encoded correctly: %q", host)
 			}
 		}
-		response := welcomePayload(isHTTP)
-		if !isWelcome(response, isHTTP) {
+		response := welcomePayload(isHTTP, nonce, session)
+		if got, ok := parseWelcome(response, isHTTP, nonce); !ok || got != session {
 			t.Fatal("welcome did not match the negotiated preface mode")
 		}
-		if isWelcome(response, !isHTTP) {
+		if _, ok := parseWelcome(response, !isHTTP, nonce); ok {
 			t.Fatal("welcome accepted for the other preface mode")
 		}
+		if _, ok := parseWelcome(response, isHTTP, nonce+1); ok {
+			t.Fatal("welcome accepted for a different client nonce")
+		}
 		for length := 0; length < len(request); length++ {
-			if _, ok := parseHello(request[:length]); ok {
+			if _, _, ok := parseHello(request[:length]); ok {
 				t.Fatalf("accepted truncated hello at %d/%d", length, len(request))
 			}
 		}
 		for length := 0; length < len(response); length++ {
-			if isWelcome(response[:length], isHTTP) {
+			if _, ok := parseWelcome(response[:length], isHTTP, nonce); ok {
 				t.Fatalf("accepted truncated welcome at %d/%d", length, len(response))
 			}
 		}
-		if _, ok := parseHello(append(request, 0)); ok {
+		if _, _, ok := parseHello(append(request, 0)); ok {
 			t.Fatal("accepted trailing bytes after hello")
 		}
-		if isWelcome(append(response, 0), isHTTP) {
+		if _, ok := parseWelcome(append(response, 0), isHTTP, nonce); ok {
 			t.Fatal("accepted trailing bytes after welcome")
 		}
 	}
 	bad := [][]byte{
 		[]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
 		[]byte("GET / HTTP/1.1\r\nHost: example.com"),
-		helloPayload(strings.Repeat("a", 512)),
+		helloPayload(strings.Repeat("a", 512), nonce),
 		makeTestFrame(frameHello, []byte{1}),
 		makeTestFrame(frameData, nil),
 	}
 	for i, b := range bad {
-		if _, ok := parseHello(b); ok {
+		if _, _, ok := parseHello(b); ok {
 			t.Fatalf("accepted malformed hello %d", i)
 		}
 	}
@@ -336,7 +341,7 @@ func FuzzParseSegmentAndFrames(f *testing.F) {
 		{0},
 		make([]byte, 20),
 		makeTestFrame(frameData, []byte("a datagram")),
-		helloPayload(""), helloPayload("cover.example"), welcomePayload(true),
+		helloPayload("", 123), helloPayload("cover.example", 123), welcomePayload(true, 123, 456),
 	} {
 		f.Add(seed)
 	}
@@ -380,9 +385,9 @@ func FuzzParseSegmentAndFrames(f *testing.F) {
 				records = rest
 			}
 		}
-		_, _ = parseHello(b)
-		_ = isWelcome(b, false)
-		_ = isWelcome(b, true)
+		_, _, _ = parseHello(b)
+		_, _ = parseWelcome(b, false, 123)
+		_, _ = parseWelcome(b, true, 123)
 	})
 }
 

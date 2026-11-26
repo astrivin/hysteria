@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-type packetWriter interface{ WritePacket([]byte) error }
+type packetWriter interface {
+	WritePacket([]byte) error
+	TryWritePacket([]byte) error
+}
 
 type packetIO interface {
 	ReadPacket([]byte) ([]byte, netip.Addr, netip.Addr, error)
@@ -38,6 +41,8 @@ type peer struct {
 	writer           packetWriter
 	initialSeq       uint32
 	remoteInitialSeq uint32
+	nonce            uint64
+	session          uint64
 	// sendSeq is protected by conn.writeMu; ACK and activity also change on read.
 	sendSeq    uint32
 	recvNext   atomic.Uint32
@@ -65,10 +70,11 @@ type conn struct {
 	peers        map[peerKey]*peer
 	replies      map[*net.UDPAddr]*peer
 	lastSweep    time.Time // protected by readMu
-	readBuf      [maxPacketLen]byte
+	readBuf      [maxReceivePacketLen]byte
 	writeBuf     [maxPacketLen]byte
 	pending      []byte // remaining records in readBuf after GRO
 	pendingPeer  *peer
+	pendingSeq   uint32
 }
 
 func newConn(io packetIO, config Config, remote netip.AddrPort) (*conn, error) {
@@ -82,6 +88,7 @@ func newConn(io packetIO, config Config, remote netip.AddrPort) (*conn, error) {
 			return nil, err
 		}
 		c.client = p
+		p.nonce = binary.BigEndian.Uint64(c.secret[4:12])
 	}
 	return c, nil
 }
@@ -106,12 +113,37 @@ func (c *conn) opError(op string, addr net.Addr, err error) error {
 func (c *conn) sendAt(p *peer, seq uint32, flags byte, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.writeAt(p, seq, flags, payload, false)
+}
+
+// Control replies must not wait for a writer: ReadFrom's deadline also drives
+// QUIC transport shutdown. The client retries a dropped SYN-ACK or welcome.
+func (c *conn) replyAt(p *peer, seq uint32, flags byte, payload []byte) error {
+	if !c.writeMu.TryLock() {
+		return syscall.EAGAIN
+	}
+	defer c.writeMu.Unlock()
+	return c.writeAt(p, seq, flags, payload, true)
+}
+
+// writeAt requires writeMu. Only the initial client handshake may wait to send;
+// it has a write deadline and does not run inside ReadFrom.
+func (c *conn) writeAt(p *peer, seq uint32, flags byte, payload []byte, nonblocking bool) error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	n := marshalSegment(c.writeBuf[:], p.key.local, p.key.remote, seq, p.recvNext.Load(), flags, payload, c.config.MTU)
-	err := p.writer.WritePacket(c.writeBuf[:n])
-	if err == nil {
+	ack := p.recvNext.Load()
+	if flags == flagSYN|flagACK {
+		ack = p.remoteInitialSeq + 1
+	}
+	n := marshalSegment(c.writeBuf[:], p.key.local, p.key.remote, seq, ack, flags, payload, c.config.MTU)
+	var err error
+	if nonblocking {
+		err = p.writer.TryWritePacket(c.writeBuf[:n])
+	} else {
+		err = p.writer.WritePacket(c.writeBuf[:n])
+	}
+	if err == nil && flags&flagSYN == 0 {
 		p.lastActive.Store(time.Now().UnixNano())
 	}
 	return err
@@ -127,11 +159,11 @@ func advanceACK(p *peer, seq uint32) {
 }
 
 // The cookie binds both endpoints and the client ISN. A replacement also binds
-// the current peer's ISNs, so an old hello cannot restore a retired generation.
+// the current peer's ISNs and session, so an old hello cannot restore a retired generation.
 // SYNs retain no new half-open peer state or timer. Accept cookies from the
 // current and prior minute.
 func (c *conn) cookie(key peerKey, seq uint32, minute int64, previous *peer) uint32 {
-	var b [57]byte
+	var b [65]byte
 	local, remote := key.local.Addr().As16(), key.remote.Addr().As16()
 	copy(b[:16], local[:])
 	copy(b[16:32], remote[:])
@@ -142,7 +174,8 @@ func (c *conn) cookie(key peerKey, seq uint32, minute int64, previous *peer) uin
 	if previous != nil {
 		b[48] = 1
 		binary.BigEndian.PutUint32(b[49:53], previous.initialSeq)
-		binary.BigEndian.PutUint32(b[53:], previous.remoteInitialSeq)
+		binary.BigEndian.PutUint32(b[53:57], previous.remoteInitialSeq)
+		binary.BigEndian.PutUint64(b[57:], previous.session)
 	}
 	h := hmac.New(sha256.New, c.secret[:])
 	_, _ = h.Write(b[:])
@@ -182,7 +215,7 @@ func (c *conn) handshake() error {
 	if err := c.io.SetWriteDeadline(end); err != nil {
 		return err
 	}
-	hello := helloPayload(c.config.Host)
+	hello := helloPayload(c.config.Host, p.nonce)
 	helloSeq := p.sendSeq
 	haveCookie := false
 	// Retry SYN as well as hello: another handshake can replace the server
@@ -221,9 +254,11 @@ func (c *conn) handshake() error {
 				}
 				continue
 			}
-			if !haveCookie || s.flags&(flagACK|flagSYN|flagRST|flagFIN) != flagACK || s.seq != p.remoteInitialSeq+1 || s.ack != helloSeq+uint32(len(hello)) || !isWelcome(s.payload, c.config.Host != "") {
+			session, welcome := parseWelcome(s.payload, c.config.Host != "", p.nonce)
+			if !haveCookie || s.flags&(flagACK|flagSYN|flagRST|flagFIN) != flagACK || s.seq != p.remoteInitialSeq+1 || s.ack != helloSeq+uint32(len(hello)) || !welcome {
 				continue
 			}
+			p.session = session
 			p.sendSeq = helloSeq + uint32(len(hello))
 			p.recvNext.Store(s.seq + uint32(len(s.payload)))
 			p.ready.Store(true)
@@ -282,25 +317,32 @@ func (c *conn) accept(s segment, key peerKey) (*peer, error) {
 		}
 		// An unrelated peer must not be able to terminate the shared listener by
 		// provoking a route error while it sends a SYN.
-		_ = c.sendAt(p, seq, flagSYN|flagACK, nil)
+		_ = c.replyAt(p, seq, flagSYN|flagACK, nil)
 		return nil, nil
 	}
 	if s.flags&(flagACK|flagSYN|flagRST|flagFIN) != flagACK {
 		return nil, nil
 	}
 	p := c.findPeer(key)
-	_, hello := parseHello(s.payload)
+	nonce, http, hello := parseHello(s.payload)
+	if p == nil && !hello {
+		return nil, nil
+	}
 	// Reuse of the same four-tuple after a client restart must replace stale
 	// state, but only after the new peer proves the SYN cookie. A bare SYN
 	// cannot tear down an established QUIC session.
-	if p == nil || (hello && (s.seq != p.remoteInitialSeq+1 || s.ack != p.initialSeq+1)) {
+	if p == nil || (hello && (s.seq != p.remoteInitialSeq+1 || s.ack != p.initialSeq+1 || nonce != p.nonce)) {
 		seq := s.ack - 1
 		minute := now.Unix() / 60
 		valid := seq == c.cookie(key, s.seq-1, minute, p) || seq == c.cookie(key, s.seq-1, minute-1, p)
 		if !valid {
-			if p == nil {
-				return nil, nil
+			if p != nil && s.seq == p.remoteInitialSeq+1 && nonce != p.nonce {
+				// A restarted client can reuse its ISN. Challenge its new nonce
+				// with a cookie bound to the current session before replacing it.
+				seq = c.cookie(key, s.seq-1, minute, p)
+				_ = c.replyAt(p, seq, flagSYN|flagACK, nil)
 			}
+			return nil, nil
 		} else {
 			c.peersMu.RLock()
 			full := p == nil && len(c.peers) >= maxPeers
@@ -312,6 +354,11 @@ func (c *conn) accept(s segment, key peerKey) (*peer, error) {
 			if err != nil {
 				return nil, err
 			}
+			var session [sessionIDLen]byte
+			if _, err := rand.Read(session[:]); err != nil {
+				return nil, err
+			}
+			next.nonce, next.session = nonce, binary.BigEndian.Uint64(session[:])
 			c.peersMu.Lock()
 			if p != nil {
 				delete(c.replies, p.addr)
@@ -326,8 +373,7 @@ func (c *conn) accept(s segment, key peerKey) (*peer, error) {
 		return nil, nil
 	}
 	if s.seq == p.remoteInitialSeq+1 {
-		http, ok := parseHello(s.payload)
-		if !ok {
+		if !hello {
 			if p.ready.Load() {
 				return p, nil
 			}
@@ -337,19 +383,18 @@ func (c *conn) accept(s segment, key peerKey) (*peer, error) {
 			p.helloSeq = s.seq
 			p.helloLen = len(s.payload)
 			p.welcomeSeq = p.initialSeq + 1
-			p.welcome = welcomePayload(http)
+			p.welcome = welcomePayload(http, p.nonce, p.session)
 		}
 		if s.seq != p.helloSeq || len(s.payload) != p.helloLen {
 			return nil, nil
 		}
 		advanceACK(p, s.seq+uint32(len(s.payload)))
-		if err := c.sendAt(p, p.welcomeSeq, flagACK|flagPSH, p.welcome); err != nil {
+		if err := c.replyAt(p, p.welcomeSeq, flagACK|flagPSH, p.welcome); err != nil {
 			return nil, nil
 		}
 		if !p.ready.Load() {
-			c.writeMu.Lock()
+			// Writers cannot use this peer until ready publishes its send state.
 			p.sendSeq = p.welcomeSeq + uint32(len(p.welcome))
-			c.writeMu.Unlock()
 			p.ready.Store(true)
 		}
 		return nil, nil
@@ -377,10 +422,16 @@ func (c *conn) ReadFrom(b []byte) (int, net.Addr, error) {
 				continue
 			}
 			c.pending = rest
-			if kind != frameData {
+			c.pendingSeq += uint32(frameHeaderLen + len(payload))
+			p := c.pendingPeer
+			if kind != frameData || len(payload) < sessionIDLen || binary.BigEndian.Uint64(payload) != p.session {
 				continue
 			}
-			return copy(b, payload), c.pendingPeer.addr, nil
+			// Validate the generation before changing outer ACK/activity.
+			// QUIC still handles duplicate, reordered and unauthenticated data.
+			advanceACK(p, c.pendingSeq)
+			p.lastActive.Store(time.Now().UnixNano())
+			return copy(b, payload[sessionIDLen:]), p.addr, nil
 		}
 		s, key, err := c.readSegment()
 		if err != nil {
@@ -398,29 +449,22 @@ func (c *conn) ReadFrom(b []byte) (int, net.Addr, error) {
 		} else {
 			p = c.client
 			if s.flags&(flagSYN|flagACK|flagRST) == flagSYN|flagACK && s.seq == p.remoteInitialSeq {
-				c.writeMu.Lock()
-				seq := p.sendSeq
-				c.writeMu.Unlock()
-				_ = c.sendAt(p, seq, flagACK, nil)
+				if c.writeMu.TryLock() {
+					_ = c.writeAt(p, p.sendSeq, flagACK, nil, true)
+					c.writeMu.Unlock()
+				}
 				continue
 			}
 			if s.flags&(flagACK|flagSYN|flagRST|flagFIN) != flagACK || len(s.payload) == 0 {
 				continue
 			}
 			// A lost handshake ACK can cause the last response to be duplicated.
-			if s.seq == p.remoteInitialSeq+1 && isWelcome(s.payload, c.config.Host != "") {
+			if _, welcome := parseWelcome(s.payload, c.config.Host != "", p.nonce); s.seq == p.remoteInitialSeq+1 && welcome {
 				continue
 			}
 		}
-		// Validate framing before advancing TCP acknowledgement state. Delivery
-		// deliberately accepts reordered and duplicate datagrams; QUIC handles them.
-		kind, _, _, ok := nextFrame(s.payload)
-		if !ok || kind != frameData {
-			continue
-		}
-		advanceACK(p, s.seq+uint32(len(s.payload)))
-		p.lastActive.Store(time.Now().UnixNano())
 		c.pending, c.pendingPeer = s.payload, p
+		c.pendingSeq = s.seq
 	}
 }
 
@@ -433,7 +477,7 @@ func (c *conn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if err != nil {
 		return 0, c.opError("write", addr, err)
 	}
-	if len(b) > c.config.MTU-ipHeaderLen(remote.Addr())-tcpHeaderLen-frameHeaderLen {
+	if len(b) > c.config.MTU-ipHeaderLen(remote.Addr())-tcpHeaderLen-dataHeaderLen {
 		return 0, c.opError("write", addr, syscall.EMSGSIZE)
 	}
 	if c.closed.Load() {
@@ -481,10 +525,12 @@ func (c *conn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	}
 	// Build the data record directly in the send buffer: one payload copy and
 	// no packet objects, encryption, intermediate UDP socket, or goroutine hop.
-	payload := c.writeBuf[tcpHeaderLen : tcpHeaderLen+frameHeaderLen+len(b)]
-	putFrameHeader(payload, frameData, len(b))
-	copy(payload[frameHeaderLen:], b)
-	n := marshalSegment(c.writeBuf[:], p.key.local, p.key.remote, p.sendSeq, p.recvNext.Load(), flagACK|flagPSH, payload, c.config.MTU)
+	payload := c.writeBuf[tcpHeaderLen : tcpHeaderLen+dataHeaderLen+len(b)]
+	putFrameHeader(payload, frameData, sessionIDLen+len(b))
+	binary.BigEndian.PutUint64(payload[frameHeaderLen:], p.session)
+	copy(payload[dataHeaderLen:], b)
+	// PSH would force Linux software GRO to flush every data segment.
+	n := marshalSegment(c.writeBuf[:], p.key.local, p.key.remote, p.sendSeq, p.recvNext.Load(), flagACK, payload, c.config.MTU)
 	if err := p.writer.WritePacket(c.writeBuf[:n]); err != nil {
 		return 0, c.opError("write", addr, err)
 	}
