@@ -1526,7 +1526,7 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	if c.TrafficStats.Listen != "" {
 		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
 		hyConfig.TrafficLogger = tss
-		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
+		go runTrafficStatsServer(c.TrafficStats.Listen, tss, func() error { return closeServerConfig(hyConfig) })
 	}
 	return nil
 }
@@ -1684,7 +1684,7 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 			},
 			ForceHTTPS: c.Masquerade.ForceHTTPS,
 		}
-		go runMasqTCPServer(&s, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS)
+		go runMasqTCPServer(&s, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS, func() error { return closeServerConfig(hyConfig) })
 	}
 	return nil
 }
@@ -1710,17 +1710,22 @@ func (c *serverConfig) Config() (*server.Config, error) {
 	}
 	for _, f := range fillers {
 		if err := f(hyConfig); err != nil {
-			if hyConfig.Conn != nil {
-				_ = hyConfig.Conn.Close()
-			}
-			if hyConfig.Cleanup != nil {
-				_ = hyConfig.Cleanup.Close()
-			}
-			return nil, err
+			return nil, errors.Join(err, closeServerConfig(hyConfig))
 		}
 	}
 
 	return hyConfig, nil
+}
+
+func closeServerConfig(config *server.Config) error {
+	var err error
+	if config.Conn != nil {
+		err = config.Conn.Close()
+	}
+	if config.Cleanup != nil {
+		err = errors.Join(err, config.Cleanup.Close())
+	}
+	return err
 }
 
 func runServerCmd(cmd *cobra.Command, args []string) {
@@ -1729,6 +1734,10 @@ func runServerCmd(cmd *cobra.Command, args []string) {
 }
 
 func runServer(v *viper.Viper) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalChan)
+
 	if err := v.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read server config", zap.Error(err))
 	}
@@ -1759,6 +1768,7 @@ func runServer(v *viper.Viper) {
 
 	s, err := server.NewServer(hyConfig)
 	if err != nil {
+		err = errors.Join(err, closeServerConfig(hyConfig))
 		logger.Fatal("failed to initialize server", zap.Error(err))
 	}
 	if config.Listen != "" {
@@ -1770,10 +1780,6 @@ func runServer(v *viper.Viper) {
 	if !disableUpdateCheck {
 		go runCheckUpdateServer()
 	}
-
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signalChan)
 
 	serveErrChan := make(chan error, 1)
 	go func() {
@@ -1796,14 +1802,14 @@ func runServer(v *viper.Viper) {
 	}
 }
 
-func runTrafficStatsServer(listen string, handler http.Handler) {
+func runTrafficStatsServer(listen string, handler http.Handler, cleanup func() error) {
 	logger.Info("traffic stats server up and running", zap.String("listen", listen))
 	if err := correctnet.HTTPListenAndServe(listen, handler); err != nil {
-		logger.Fatal("failed to serve traffic stats", zap.Error(err))
+		logger.Fatal("failed to serve traffic stats", zap.Error(errors.Join(err, cleanup())))
 	}
 }
 
-func runMasqTCPServer(s *masq.MasqTCPServer, httpAddr, httpsAddr string) {
+func runMasqTCPServer(s *masq.MasqTCPServer, httpAddr, httpsAddr string, cleanup func() error) {
 	errChan := make(chan error, 2)
 	if httpAddr != "" {
 		go func() {
@@ -1819,7 +1825,7 @@ func runMasqTCPServer(s *masq.MasqTCPServer, httpAddr, httpsAddr string) {
 	}
 	err := <-errChan
 	if err != nil {
-		logger.Fatal("failed to serve masquerade HTTP(S)", zap.Error(err))
+		logger.Fatal("failed to serve masquerade HTTP(S)", zap.Error(errors.Join(err, cleanup())))
 	}
 }
 

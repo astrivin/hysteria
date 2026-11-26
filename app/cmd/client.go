@@ -851,6 +851,10 @@ func runClientCmd(cmd *cobra.Command, args []string) {
 }
 
 func runClient(v *viper.Viper) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalChan)
+
 	if err := v.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read client config", zap.Error(err))
 	}
@@ -942,10 +946,6 @@ func runClient(v *viper.Viper) {
 			return tunServer.Serve()
 		})
 	}
-
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signalChan)
 
 	runnerChan := make(chan clientModeRunnerResult, 1)
 	go func() {

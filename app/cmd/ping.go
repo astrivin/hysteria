@@ -1,6 +1,10 @@
 package cmd
 
 import (
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -33,6 +37,9 @@ func runPingCmd(cmd *cobra.Command, args []string) {
 }
 
 func runPing(v *viper.Viper, addr string) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	if err := v.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read client config", zap.Error(err))
 	}
@@ -50,9 +57,14 @@ func runPing(v *viper.Viper, addr string) {
 
 	c, info, err := client.NewClient(hyConfig)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
 	defer c.Close()
+	stopClose := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stopClose()
 	logger.Info("connected to server",
 		zap.String("addr", info.ServerAddr.String()),
 		zap.Bool("udpEnabled", info.UDPEnabled),
@@ -62,6 +74,10 @@ func runPing(v *viper.Viper, addr string) {
 	start := time.Now()
 	conn, err := c.TCP(addr)
 	if err != nil {
+		_ = c.Close()
+		if ctx.Err() != nil {
+			return
+		}
 		logger.Fatal("failed to connect", zap.Error(err), zap.String("time", time.Since(start).String()))
 	}
 	defer conn.Close()

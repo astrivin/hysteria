@@ -56,6 +56,10 @@ func runSpeedtestCmd(cmd *cobra.Command, args []string) {
 }
 
 func runSpeedtest(v *viper.Viper, sizeBased bool) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalChan)
+
 	if err := v.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read client config", zap.Error(err))
 	}
@@ -80,10 +84,6 @@ func runSpeedtest(v *viper.Viper, sizeBased bool) {
 		zap.String("addr", info.ServerAddr.String()),
 		zap.Bool("udpEnabled", info.UDPEnabled),
 		zap.Uint64("tx", info.Tx))
-
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signalChan)
 
 	runChan := make(chan struct{}, 1)
 	go func() {
@@ -112,6 +112,7 @@ func runSingleTest(c client.Client, sizeBased, download bool) {
 	logger.Info("performing " + name + " test")
 	conn, err := c.TCP(speedtestAddr)
 	if err != nil {
+		_ = c.Close()
 		if errors.As(err, &hyErrors.DialError{}) {
 			logger.Fatal("failed to connect (server may not support speed test)", zap.Error(err))
 		} else {
@@ -153,6 +154,7 @@ func runSingleTest(c client.Client, sizeBased, download bool) {
 		err = sc.Upload(dataSize, dur, cb)
 	}
 	if err != nil {
+		_ = c.Close()
 		logger.Fatal(name+" test failed", zap.Error(err))
 	}
 	logger.Info(name + " test complete")
