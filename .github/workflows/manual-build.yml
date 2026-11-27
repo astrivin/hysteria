@@ -1,0 +1,178 @@
+name: Manual stripped build
+run-name: Stripped build ${{ inputs.commit }} (${{ inputs.platform_scope }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "要构建的完整提交 SHA（40 位）"
+        required: true
+        type: string
+      platform_scope:
+        description: "平台范围：faketcp 为当前四个平台，all 为完整平台列表"
+        required: true
+        type: choice
+        default: faketcp
+        options:
+          - faketcp
+          - all
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate requested commit
+        id: request
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          if [[ ! "$REQUESTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::commit must be a full 40-character commit SHA"
+            exit 1
+          fi
+          requested_sha=$(printf '%s' "$REQUESTED_COMMIT" | tr '[:upper:]' '[:lower:]')
+          printf 'sha=%s\n' "$requested_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out requested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.request.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm source commit
+        id: source
+        env:
+          REQUESTED_COMMIT: ${{ steps.request.outputs.sha }}
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          if [[ "$source_sha" != "$REQUESTED_COMMIT" ]]; then
+            echo "::error::checked-out commit differs from the requested commit"
+            exit 1
+          fi
+          printf 'sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Select platforms
+        env:
+          PLATFORM_SCOPE: ${{ inputs.platform_scope }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          scope = os.environ["PLATFORM_SCOPE"]
+          if scope == "faketcp":
+              platforms = [
+                  "linux/amd64", "linux/arm64",
+                  "android/arm64", "android/armv7",
+              ]
+          elif scope == "all":
+              platforms = [
+                  line.strip()
+                  for line in Path("platforms.txt").read_text().splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+          else:
+              raise SystemExit("platform_scope must be faketcp or all")
+
+          if not platforms or any(
+              re.fullmatch(r"[a-z0-9]+/[a-z0-9-]+", item) is None
+              for item in platforms
+          ):
+              raise SystemExit("platform list is empty or contains invalid entries")
+          if len(platforms) != len(set(platforms)):
+              raise SystemExit("platform list contains duplicate entries")
+
+          files = [
+              "hysteria-" + item.replace("/", "-")
+              + (".exe" if item.startswith("windows/") else "")
+              for item in platforms
+          ]
+          expected = Path(os.environ["RUNNER_TEMP"]) / "manual-build-files.json"
+          expected.write_text(json.dumps(files) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write("HY_APP_PLATFORMS=" + ",".join(platforms) + "\n")
+          print("Selected platforms: " + ", ".join(platforms))
+          PY
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: |
+            app/go.sum
+            core/go.sum
+            extras/go.sum
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r29
+          add-to-path: false
+
+      - name: Build stripped executables
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          HY_APP_COMMIT: ${{ steps.source.outputs.sha }}
+        run: python3 hyperbole.py build -r
+
+      - name: Verify files and generate checksums
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          expected_file = Path(os.environ["RUNNER_TEMP"]) / "manual-build-files.json"
+          expected = set(json.loads(expected_file.read_text()))
+          build = Path("build")
+          actual = {p.name for p in build.glob("hysteria-*") if p.is_file()}
+          if actual != expected:
+              raise SystemExit(
+                  "Executable set differs from selected platforms: "
+                  f"missing={sorted(expected - actual)}, "
+                  f"unexpected={sorted(actual - expected)}"
+              )
+          checksums = []
+          summary = [
+              "Source commit: " + os.environ["SOURCE_COMMIT"],
+              "",
+              "Build command: python3 hyperbole.py build -r",
+              "",
+              "| Executable | Size (MiB) |",
+              "| --- | ---: |",
+          ]
+          for name in sorted(expected):
+              path = build / name
+              size = path.stat().st_size
+              if size == 0:
+                  raise SystemExit("Empty executable: " + name)
+              with path.open("rb") as program:
+                  digest = hashlib.file_digest(program, "sha256").hexdigest()
+              checksums.append(f"{digest}  {name}\n")
+              summary.append(f"| {name} | {size / 1048576:.2f} |")
+          (build / "SHA256SUMS").write_text("".join(checksums))
+          (build / "COMMIT").write_text(os.environ["SOURCE_COMMIT"] + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write("\n".join(summary) + "\n")
+          print(f"Prepared {len(expected)} executables and checksum manifest")
+          PY
+
+      - name: Upload executables
+        uses: actions/upload-artifact@v7
+        with:
+          name: hysteria-stripped-${{ steps.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/hysteria-*
+            build/COMMIT
+            build/SHA256SUMS
+          if-no-files-found: error
