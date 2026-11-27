@@ -442,6 +442,9 @@ func afwSwitchPath(t *testing.T, ns, path, old string) {
 		network = 207
 	}
 	afwCommand(t, "ip", "-n", ns, "link", "set", "dev", path, "up")
+	// IPv6 addresses can be removed when the old interface goes down. Restore
+	// the address before rebuilding its route, as a network manager would.
+	afwCommand(t, "ip", "-n", ns, "-6", "addr", "replace", fmt.Sprintf("fd73:%d::2/64", network), "dev", path, "nodad")
 	afwCommand(t, "ip", "-n", ns, "route", "replace", "10.209.0.1/32", "via", fmt.Sprintf("10.%d.0.1", network), "dev", path, "src", fmt.Sprintf("10.%d.0.2", network))
 	afwCommand(t, "ip", "-n", ns, "-6", "route", "replace", "fd73:209::1/128", "via", fmt.Sprintf("fd73:%d::1", network), "dev", path, "src", fmt.Sprintf("fd73:%d::2", network))
 	if old != "" {
