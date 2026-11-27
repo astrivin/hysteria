@@ -22,6 +22,7 @@ transport:
     minHopInterval: 10s
     maxHopInterval: 50s
   faketcp:
+    autoFirewall: true
     localAddr: 192.0.2.1:30443
     mtu: 1400
     host: www.example.org

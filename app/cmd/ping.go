@@ -47,8 +47,13 @@ func runPing(v *viper.Viper, addr string) {
 	if err := v.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
+	cleanup, err := config.startFakeTCPFirewall()
+	if err != nil {
+		logger.Fatal("failed to set up FakeTCP firewall", zap.Error(err))
+	}
 	hyConfig, err := config.Config()
 	if err != nil {
+		_ = closeFakeTCPFirewall(cleanup)
 		logger.Fatal("failed to load client config", zap.Error(err))
 	}
 
@@ -57,11 +62,13 @@ func runPing(v *viper.Viper, addr string) {
 
 	c, info, err := client.NewClient(hyConfig)
 	if err != nil {
+		_ = closeFakeTCPFirewall(cleanup)
 		if ctx.Err() != nil {
 			return
 		}
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
+	c = withFakeTCPFirewall(c, cleanup)
 	defer c.Close()
 	stopClose := context.AfterFunc(ctx, func() { _ = c.Close() })
 	defer stopClose()

@@ -28,8 +28,9 @@ func TestServerConfig(t *testing.T) {
 		Transport: serverConfigTransport{
 			Type: "udp",
 			FakeTCP: serverConfigTransportFakeTCP{
-				MTU:         1400,
-				IdleTimeout: 3 * time.Minute,
+				AutoFirewall: true,
+				MTU:          1400,
+				IdleTimeout:  3 * time.Minute,
 			},
 		},
 		Realm: serverConfigRealm{

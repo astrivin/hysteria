@@ -44,6 +44,7 @@ func TestClientConfig(t *testing.T) {
 				MaxHopInterval: 50 * time.Second,
 			},
 			FakeTCP: clientConfigTransportFakeTCP{
+				AutoFirewall:     true,
 				LocalAddr:        "192.0.2.1:30443",
 				MTU:              1400,
 				Host:             "www.example.org",

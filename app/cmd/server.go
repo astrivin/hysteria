@@ -1796,6 +1796,7 @@ func runServer(v *viper.Viper) {
 			logger.Info("server stopped", zap.Error(err))
 		}
 	case err := <-serveErrChan:
+		err = errors.Join(err, s.Close())
 		if err != nil {
 			logger.Fatal("failed to serve", zap.Error(err))
 		}

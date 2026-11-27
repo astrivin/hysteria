@@ -10,18 +10,31 @@
 | --- | --- |
 | [extras/transport/faketcp](extras/transport/faketcp) | 新增独立的 `net.PacketConn` 传输：地址处理、Linux Raw Socket、TCP 编解码、握手与数据报状态、非 Linux 平台错误入口 |
 | [app/cmd/faketcp.go](app/cmd/faketcp.go) | 新增配置结构、原生连接工厂、监听创建及互斥项校验 |
+| [app/internal/firewall/faketcp_linux.go](app/internal/firewall/faketcp_linux.go) | 可选进程级自动 RST 规则：客户端仅目标 IP/端口，服务端仅监听源端口；启动添加、退出删除 |
 | [app/cmd/client.go](app/cmd/client.go)、[server.go](app/cmd/server.go) | 接入 `transport.type: faketcp`；保持 UDP 为默认传输；对原生 FakeTCP 设置安全的 QUIC 初始包大小并禁用不适用的选项 |
 | [core/client](core/client)、[core/server](core/server) | 各增加 `QUICConfig.InitialPacketSize` 字段及到 quic-go 配置的一处映射；零值沿用原默认，不增加新的 YAML 旋钮 |
 | [core/internal/congestion/brutal](core/internal/congestion/brutal) | 将最小拥塞窗口从一包修正为两包，处理低 RTT 与丢失 MTU 探测包的交互；详见下节 |
 
 服务端配置构造过程中，如果后续填充步骤失败，现在会关闭已经创建的连接和清理对象，避免配置错误后仍占用监听端口。相关回归测试验证 UDP 端口可以重新绑定。
 
+### 自动防火墙重新设计
+
+本轮从 `6b6fd55` 继续开发，保留其已验证的错误退出和信号清理修复，废弃 `c0a933a`/`cf8250d` 的逐连接防火墙设计。保留主 `Serve` 返回时等待 `s.Close()` 的必要清理，以及对应的退出竞争回归。
+
+- `extras/transport/faketcp` 和 `core` 相对该基线不作修改；不引入 `Config.Setup`、PacketConn cleanup 或每次 Dial 的防火墙操作。
+- 客户端启动一次规则，包在最外层 reconnectable Client 上，最终 Close 才清理；内部重连和失败尝试不触及规则。服务端使用已有 `server.Config.Cleanup`。
+- iptables 直接插入/删除匹配的 DROP 规则，无自定义链和客户端源地址/源端口匹配；每个进程增加/减少一条，同规格规则按数量平衡。nft 使用一张进程私有表，重连期间不变化。
+- 自动模式在启动时固定所选服务器 IP/端口并保留 TLS SNI，避免后续 DNS 选择落到静态规则之外。本地源地址继续每次按路由选择。
+- 新验收重点是同一客户端进程切换两条网络路径后恢复请求，并严格检查规则和防火墙命令记录不变；测试状态以相应提交的 Actions 日志为准。
+
+用户报告的 `TCP handshake timed out` 说明客户端在截止前未接受到当前连接的 SYN-ACK，不能仅凭这条日志确定 RST/NAT 的完整因果。旧设计确有每次关闭就撤掉旧端点规则的生命周期缺口；本轮按用户已验证的固定目标规则方式修正，不把未复现的选路或 conntrack 猜测作为额外代码修改依据。
+
 新增传输直接在 Hysteria 进程内工作，不启动 udp2raw、Phantun 或 mimic，不增加本地 UDP 中转进程。QUIC 的 TLS、Hysteria 认证、可靠流、DATAGRAM 和拥塞控制仍由原有核心处理；外层 FakeTCP 不对业务数据再次重传，也不引入标准 TCP 的可靠字节流和拥塞控制。
 
 ### 原生传输与协议
 
 - Linux 后端使用 `AF_INET`/`AF_INET6` Raw IP Socket，自行生成 TCP 头与校验和；普通未连接的 TCP socket 仅用于保留本地端口。
-- 使用经典 socket BPF 过滤目标端口，减少无关包进入用户态；不使用 eBPF、TC/XDP、TUN 或专用内核模块。程序不会修改防火墙或加载模块。
+- 使用经典 socket BPF 过滤目标端口，减少无关包进入用户态；不使用 eBPF、TC/XDP、TUN 或专用内核模块。仅显式开启 `autoFirewall` 时由应用层管理固定 RST 规则，不加载模块。
 - 实现外层 SYN/SYN-ACK/ACK 和协议前导交换，包括握手重试、重复报文处理、SYN cookie 校验、同四元组重连、服务端状态过期与回收；服务端状态上限为 4096 个对端。
 - 重连用的 SYN cookie 绑定当前连接的双方初始序号及会话标识，防止旧 hello 把服务端切回旧连接。v2 hello 携带客户端随机 nonce，welcome 回显 nonce 并分配服务端随机会话 ID；同 ISN 的新客户端也须完成绑定当前代际的 cookie 挑战。控制面回复使用非阻塞发送，客户端重试恢复丢弃的回复；不增加后台队列或每 peer goroutine。
 - v2 数据报有 4 字节长度帧头及 8 字节会话标识。接收端逐帧校验会话后才更新 ACK/活动时间，继续允许合法乱序、重复与序号回绕。普通数据段不带 PSH，接收端支持有界的 BIG TCP 聚合；业务数据校验仍由 QUIC 负责。
@@ -43,6 +56,7 @@ FakeTCP 双端固定从 1200 字节 QUIC 初始包开始，随后继续使用 DP
 | 配置 | 使用端 | 默认值 |
 | --- | --- | --- |
 | `transport.type: faketcp` | 双端 | 未设置时仍使用 UDP |
+| `transport.faketcp.autoFirewall` | 双端 | false；启用后按进程管理固定 RST 规则 |
 | `transport.faketcp.mtu` | 双端 | 1500，允许 1280～65535 |
 | `transport.faketcp.localAddr` | 客户端 | 按路由选源地址并分配临时 TCP 端口 |
 | `transport.faketcp.host` | 客户端 | 空，不添加 HTTP Host 前导 |
@@ -55,7 +69,7 @@ HTTP Host 仅用于外层握手中的短 HTTP 前导，不改变实际服务器�
 
 服务端 `:port` 或 `0.0.0.0:port` 选择 IPv4；`[::]:port` 是 IPv6-only，双栈需要两个实例。Linux 内核目标包括具备实际权限的 WSL2 和 Android；非 Linux 平台选择此传输返回不支持错误，仍可使用 UDP。
 
-运行时需要 `CAP_NET_RAW`；非 root 绑定受保护端口时还可能需要 `CAP_NET_BIND_SERVICE`。配置防火墙需要管理员/`CAP_NET_ADMIN` 权限；预先配置好规则后，Hysteria 不需要为了维护规则保留该能力。标准 Netfilter `raw` 表是否可用仍取决于系统内核和防火墙后端。
+运行时需要 `CAP_NET_RAW`；非 root 绑定受保护端口时还可能需要 `CAP_NET_BIND_SERVICE`。配置防火墙需要管理员/`CAP_NET_ADMIN` 权限；手工规则模式无需为了维护规则保留该能力，自动模式的 nft/iptables 子命令在启动、退出时均需相应权限。标准 Netfilter `raw` 表是否可用仍取决于系统内核和防火墙后端。
 
 部署必须在 **conntrack 之前的 `raw/OUTPUT`** 丢弃匹配该服务的本机 RST，普通 filter 表的位置太晚；不能照搬 udp2raw 的 INPUT DROP，否则 Raw IP Socket 也收不到入站数据。具体命令、删除规则和双栈差异集中在 [部署文档](FAKETCP.md#权限与防火墙)。
 
@@ -75,6 +89,7 @@ HTTP Host 仅用于外层握手中的短 HTTP 前导，不改变实际服务器�
 - [app/cmd/faketcp_test.go](app/cmd/faketcp_test.go)：配置字段、互斥项、默认 UDP、Host/SNI 独立、QUIC 初始包设置及错误资源清理。
 - [integration/main.go](extras/transport/faketcp/internal/integration/main.go)：UDP/FakeTCP 对照负载，可靠流与 DATAGRAM 回显校验、重连、运行时内存和 goroutine 记录。新增 `-bandwidth`、`-udp-pps`、`-local-addr` 与 `FAKETCP_TEST_AUTH`，支持逐步降低负载、固定源端口和本轮随机测试口令；默认服务地址端口为 6666。
 - [test-faketcp-netns.sh](scripts/test-faketcp-netns.sh)：真实 Raw Socket 测试脚本，包含双栈、MTU 1280、远端 MTU 瓶颈且 ICMP 被屏蔽、GRO 开关、故障注入、重连和 SNAT/conntrack 状态检查。外层 mount/network/PID namespace 隔离网卡、挂载、规则、sysctl 与测试子进程；临时文件放在结果目录，服务/客户端/SNAT 端口限制在 6666～7777。它不测试两台机器之间的公网路径，也没有 mimic 对照组。
+- [test-faketcp-firewall.sh](scripts/test-faketcp-firewall.sh)：独立隔离的自动防火墙验收，覆盖 iptables/nftables、IPv4/IPv6、固定/自动源端口；通过真实应用入口检查同一客户端进程 A→B→A 切网、服务端重启后的业务恢复，以及期间规则和修改命令记录不变。另检查错误/信号退出、多个实例和已有手工规则的数量平衡。
 - [scripts/faketcp](scripts/faketcp)：只读预检、明确 PID 的资源监控和本地监控行为测试；不会自动 SSH、启动网络负载或修改防火墙。主动监控核对运行标记、启动时间和目录，并通过 pidfd 防止 PID 复用误杀。
 - [.github/workflows/faketcp.yml](.github/workflows/faketcp.yml)：分支推送/手动触发；先运行回归、竞态、微基准和真实 Linux 网络任务，成功后再构建四个平台并上传校验和。构建标为 `faketcp-candidate-<sha>`/`dev`。工作流文件存在不代表任务已成功执行。
 

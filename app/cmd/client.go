@@ -869,6 +869,10 @@ func runClient(v *viper.Viper) {
 	mimicInst := config.startMimic()
 	defer mimicInst.Close()
 
+	cleanup, err := config.startFakeTCPFirewall()
+	if err != nil {
+		logger.Fatal("failed to set up FakeTCP firewall", zap.Error(err))
+	}
 	c, err := client.NewReconnectableClient(
 		config.Config,
 		func(c client.Client, info *client.HandshakeInfo, count int) {
@@ -883,8 +887,10 @@ func runClient(v *viper.Viper) {
 		}, config.Lazy,
 	)
 	if err != nil {
+		_ = closeFakeTCPFirewall(cleanup)
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
+	c = withFakeTCPFirewall(c, cleanup)
 	defer c.Close()
 
 	uri := config.URI()

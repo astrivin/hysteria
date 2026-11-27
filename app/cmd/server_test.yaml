@@ -3,6 +3,7 @@ listen: :8443
 transport:
   type: udp
   faketcp:
+    autoFirewall: true
     mtu: 1400
     idleTimeout: 3m
 

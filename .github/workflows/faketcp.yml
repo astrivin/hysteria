@@ -79,10 +79,11 @@ jobs:
       - name: Validation tool checks
         run: |
           bash -n scripts/test-faketcp-netns.sh
+          bash -n scripts/test-faketcp-firewall.sh
           sh -n scripts/faketcp/preflight.sh
           PYTHONDONTWRITEBYTECODE=1 python scripts/faketcp/test_monitor.py
       - name: FakeTCP race tests
-        run: go test -race -count=1 -timeout=10m ./core/client ./extras/transport/faketcp/...
+        run: go test -race -count=1 -timeout=10m ./core/client ./extras/transport/faketcp/... ./app/internal/firewall ./app/cmd
       - name: MTU, replay and fuzz regressions
         run: |
           go test -run TestQUICBrutalMTU1280 -count=10 -v ./extras/transport/faketcp
@@ -115,9 +116,13 @@ jobs:
             core/go.sum
             extras/go.sum
       - name: Test dependencies
-        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables ethtool procps conntrack
-      - name: Build integration harness
-        run: go build -trimpath -o build/faketcp-integration ./extras/transport/faketcp/internal/integration
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables nftables ethtool procps conntrack
+      - name: Build integration harnesses
+        run: |
+          go build -trimpath -o build/faketcp-integration ./extras/transport/faketcp/internal/integration
+          go test -c -o build/faketcp-firewall.test ./app/cmd
+      - name: Static firewall lifecycle and network migration
+        run: sudo bash scripts/test-faketcp-firewall.sh
       - name: Real Raw Socket and QUIC/Brutal tests
         env:
           SOAK_MINUTES: ${{ inputs.soak_minutes || '10' }}
@@ -127,14 +132,18 @@ jobs:
       - name: Make this job's network results readable
         if: always()
         run: |
-          if [[ -d build/faketcp-results ]]; then
-            sudo chown -hR -- "$(id -u):$(id -g)" build/faketcp-results
-          fi
+          for results in build/faketcp-results build/faketcp-firewall-results; do
+            if [[ -d "$results" ]]; then
+              sudo chown -hR -- "$(id -u):$(id -g)" "$results"
+            fi
+          done
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: faketcp-network-results-${{ github.sha }}
-          path: build/faketcp-results/
+          path: |
+            build/faketcp-results/
+            build/faketcp-firewall-results/
           if-no-files-found: warn
 
   build:

@@ -67,8 +67,13 @@ func runSpeedtest(v *viper.Viper, sizeBased bool) {
 	if err := v.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
+	cleanup, err := config.startFakeTCPFirewall()
+	if err != nil {
+		logger.Fatal("failed to set up FakeTCP firewall", zap.Error(err))
+	}
 	hyConfig, err := config.Config()
 	if err != nil {
+		_ = closeFakeTCPFirewall(cleanup)
 		logger.Fatal("failed to load client config", zap.Error(err))
 	}
 
@@ -77,8 +82,10 @@ func runSpeedtest(v *viper.Viper, sizeBased bool) {
 
 	c, info, err := client.NewClient(hyConfig)
 	if err != nil {
+		_ = closeFakeTCPFirewall(cleanup)
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
+	c = withFakeTCPFirewall(c, cleanup)
 	defer c.Close()
 	logger.Info("connected to server",
 		zap.String("addr", info.ServerAddr.String()),

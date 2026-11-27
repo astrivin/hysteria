@@ -2,7 +2,7 @@
 
 本分支把 FakeTCP 直接接入 Hysteria 2 的 `net.PacketConn`：进程通过 Raw IP Socket 收发 TCP 格式的数据包，不经过本地 UDP 转发程序，也不需要 TUN、eBPF 或 mimic 的专用内核模块。QUIC 的 TLS、认证、数据可靠性和拥塞控制仍由原有 Hysteria 核心负责；外层不会再次重传业务数据或施加 TCP 拥塞控制。
 
-**当前仍是实验性候选。当前线协议为 v2，客户端和服务端必须一起更新，不能与 `c14bce9` 及更早的候选混用。** YAML 参数及防火墙规则不变。v2 为业务帧增加会话标识，修复旧连接迟到数据影响新连接 ACK 的问题；同时修复休眠恢复后的端口预留泄漏、读路径控制回复阻塞，并允许软件 GRO 聚合。修复说明、验证边界及简短复测步骤见 [FAKETCP_FIXES.md](FAKETCP_FIXES.md)。
+**当前仍是实验性候选。当前线协议为 v2，不能与 `c14bce9` 及更早的候选混用。** v2 为业务帧增加会话标识，修复旧连接迟到数据影响新连接 ACK 的问题；同时修复休眠恢复后的端口预留泄漏、读路径控制回复阻塞，并允许软件 GRO 聚合。修复说明见 [FAKETCP_FIXES.md](FAKETCP_FIXES.md)。可选的 `autoFirewall` 按进程管理固定规则，不改变线协议，与 `be0c5964` 等 v2 构建兼容，双方可以分别升级。
 
 Linux 两架构的旧候选已完成报告所列的真实 Raw Socket、双向公网低负载及各61分钟观测；用户也已在 WSL2 和 Android 运行旧候选，并报告休眠恢复缺陷。旧版本测试不能替代修复版本的设备恢复验收。持续高负载、mimic 对照与硬件 offload 仍未完成；历史证据见 [实机测试报告](FAKETCP_TEST_RESULTS.md)。
 
@@ -15,7 +15,7 @@ Linux 两架构的旧候选已完成报告所列的真实 Raw Socket、双向公
 
 ## 配置
 
-以下地址、证书路径和密码均为示例。先配置后文的防火墙规则，再启动双方。
+以下地址、证书路径和密码均为示例。示例开启自动防火墙；省略 `autoFirewall` 时，沿用后文的手工规则方式。
 
 ### 服务端 `server.yaml`
 
@@ -25,6 +25,7 @@ listen: 0.0.0.0:443
 transport:
   type: faketcp
   faketcp:
+    autoFirewall: true
     mtu: 1500
     idleTimeout: 2m
 
@@ -46,6 +47,7 @@ auth: replace-with-your-own-password
 transport:
   type: faketcp
   faketcp:
+    autoFirewall: true
     mtu: 1500
     handshakeTimeout: 5s
     # 可省略；默认按路由选择本地 IP，并分配临时 TCP 源端口。
@@ -72,6 +74,7 @@ sudo ./hysteria client -c client.yaml
 | 配置项 | 使用端 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `transport.type` | 双端 | `udp` | 选择 `faketcp` 启用本实现 |
+| `transport.faketcp.autoFirewall` | 双端 | `false` | 启动时添加固定 RST 规则，退出时删除；重连不修改规则 |
 | `transport.faketcp.mtu` | 双端 | `1500` | 外层 IP 包的发送大小上限，允许 `1280`～`65535`；不修改网卡 MTU |
 | `transport.faketcp.localAddr` | 客户端 | 空 | 本地 IP 与 TCP 源端口；端口 `0` 表示自动分配 |
 | `transport.faketcp.host` | 客户端 | 空 | 可选 HTTP Host，最多 253 字节；只允许主机名/IP及可选端口所需的字符 |
@@ -86,11 +89,44 @@ IPv6 客户端使用 `server: "[2001:db8::10]:443"`，防火墙规则相应使�
 
 ## 权限与防火墙
 
-创建 Raw Socket 需要运行进程在其网络命名空间内拥有 `CAP_NET_RAW`。本实现还通过绑定普通 TCP socket 预留端口：非 root 进程绑定 443 等受保护端口时，通常另需 `CAP_NET_BIND_SERVICE`，是否需要取决于系统的低端口策略。配置防火墙需要管理员权限或 `CAP_NET_ADMIN`；**规则预先装好后，Hysteria 进程不需要为了维护规则而持有 `CAP_NET_ADMIN`**。参见 Linux 的 [raw(7)](https://man7.org/linux/man-pages/man7/raw.7.html)。
+创建 Raw Socket 需要运行进程在其网络命名空间内拥有 `CAP_NET_RAW`。本实现还通过绑定普通 TCP socket 预留端口：非 root 进程绑定 443 等受保护端口时，通常另需 `CAP_NET_BIND_SERVICE`，是否需要取决于系统的低端口策略。配置防火墙需要管理员权限或 `CAP_NET_ADMIN`。**手工规则预先装好且 `autoFirewall: false` 时，程序不需要为了维护规则持有 `CAP_NET_ADMIN`；自动模式需要实际执行 nft/iptables 的子命令在启动和退出时均有管理权限。** 参见 Linux 的 [raw(7)](https://man7.org/linux/man-pages/man7/raw.7.html)。
 
-本程序不会运行 iptables/nft、自动增删规则、创建网卡或加载模块。root UID 本身也不能覆盖容器能力边界或 Android SELinux 的限制；目标系统必须实际允许相应 socket 操作。
+自动管理只处理本机 FakeTCP RST 规则，不改变 INPUT 策略、云安全组、路由、网卡或 NOTRACK，不调用 modprobe。root UID 本身不能覆盖容器能力边界或 Android SELinux 的限制；目标系统必须实际允许相应操作。
 
-### 一次性阻止本机内核发送 RST
+### 自动管理：启动一次，退出一次
+
+双方均可独立设置 `transport.faketcp.autoFirewall: true`。客户端规则只匹配**服务器目标 IP 和目标端口**，覆盖所有本地源 IP 和源端口；服务端只匹配**监听源端口**。以 IPv4、服务器 `198.51.100.10:6666` 为例，iptables 后端执行的规则为：
+
+```sh
+# 客户端启动
+iptables -w 5 -t raw -I OUTPUT 1 -p tcp -d 198.51.100.10 --dport 6666 --tcp-flags RST RST -j DROP
+# 客户端退出
+iptables -w 5 -t raw -D OUTPUT -p tcp -d 198.51.100.10 --dport 6666 --tcp-flags RST RST -j DROP
+
+# 服务端启动
+iptables -w 5 -t raw -I OUTPUT 1 -p tcp --sport 6666 --tcp-flags RST RST -j DROP
+# 服务端退出
+iptables -w 5 -t raw -D OUTPUT -p tcp --sport 6666 --tcp-flags RST RST -j DROP
+```
+
+IPv6 使用 `ip6tables`。iptables 不创建额外链，不添加源 IP/客户端源端口条件，也不使用规则引用计数数据库。每个进程始终插入一条，正常退出删除一条完全匹配的规则；不使用 `-C` 后跳过安装，以免多个进程共用唯一规则、其中一个退出后影响其他进程。已存在相同手工规则时，进程的这一次添加和删除保持原有规则数量。
+
+默认优先使用 PATH 中的 `nft`，没有时使用相应地址族的 iptables。nft 后端为本进程建立一张私有表，使用相同的目标/端口匹配和 output priority `-300`；这张表同样只在启动与退出时操作。可以通过已有环境变量选择后端：
+
+```sh
+sudo env HYSTERIA_FIREWALL_BACKEND=iptables ./hysteria client -c client.yaml
+sudo env HYSTERIA_FIREWALL_BACKEND=nftables ./hysteria server -c server.yaml
+```
+
+**重连、切换本地网络、源端口改变和握手失败重试均不重新安装或删除运行中的客户端规则。** 规则由最外层客户端持有，直到程序关闭；服务端规则由已有的服务器清理对象持有。Raw Socket 传输层没有防火墙回调或规则对象。
+
+自动模式启动时解析并固定本进程使用的服务器 IP/端口，后续重连继续使用该目标；原域名或显式 `tls.sni` 保留用于 TLS 校验。服务器 DNS 地址变化时重启进程，使目标和规则一起更新。即使使用 `lazy: true`，自动模式也需要在启动阶段确定目标地址。未开启自动管理时保留原有重连解析行为。
+
+要支持 Wi-Fi/移动网络切换，客户端 `localAddr` 留空，或只固定端口，例如 `localAddr: ":6666"`；不要绑定某个 Wi-Fi 的具体 IP。每次新连接仍按当前路由选择本地源 IP。已建立连接不原地迁移到另一个源 IP，切网后的请求可能先触发旧连接超时，再由现有重连机制恢复。
+
+正常关闭、SIGINT/SIGTERM 以及已覆盖的初始化/运行失败出口会清理规则。初始化期间的信号可能等待当前初始化或握手结束。删除失败会记录错误；SIGKILL、崩溃或断电无法执行清理。升级旧逐连接版本时先正常停止旧进程；新版不扫描或接管旧 `HY2-FT-*` 链。
+
+### 手工管理规则
 
 外层 TCP 由用户态处理，内核没有对应的已建立 TCP 连接，可能对收到的包产生 RST。双方需要在 **conntrack 处理之前** 丢弃这些本机 RST，而不仅是阻止它们离开机器。以下规则使用 `raw` 表的 `OUTPUT` 链，只匹配所选服务的 RST；每套规则只添加一次，并按实际端口/IP修改。
 
@@ -247,6 +283,13 @@ env GOMAXPROCS=1 GOMEMLIMIT=96MiB \
 结果包括各客户端 JSON、日志、链路统计、参数记录 `environment.txt` 与汇总 `results.json`。负载工具使用测试证书；可通过 `FAKETCP_TEST_AUTH` 为本轮两端设置相同测试口令，未设置时沿用固定隔离测试口令。它仅供隔离验收环境使用。
 
 ### CI 与尚待完成的验证
+
+自动防火墙另有 [scripts/test-faketcp-firewall.sh](scripts/test-faketcp-firewall.sh)。它在私有 mount/network/PID namespace 内运行真实应用入口，覆盖 iptables/nftables 与 IPv4/IPv6。每组同时运行固定源端口和自动源端口客户端，切换 A→B→A 两条网络路径并重启服务端，要求相同客户端进程恢复 SOCKS5 回显，同时防火墙规则和修改命令记录保持不变；另检查正常/失败退出与同规则多实例共存。需要上文的 namespace 权限以及 `nft`，不需要在宿主预先添加规则。
+
+```sh
+go test -c -o build/faketcp-firewall.test ./app/cmd
+sudo bash scripts/test-faketcp-firewall.sh
+```
 
 [.github/workflows/faketcp.yml](.github/workflows/faketcp.yml) 配置了 `faketcp` 分支推送和手动触发：运行现有测试、竞态检查、微基准及上述 Linux 网络用例；手动压力时间允许每种传输 1～120 分钟。只有测试和网络任务都成功，才继续构建 Linux amd64/arm64 与 Android arm64/armv7，并把二进制和 `SHA256SUMS` 上传为该次 Actions 的 artifact。
 
