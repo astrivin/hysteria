@@ -420,11 +420,11 @@ func afwNamespaces(t *testing.T) (string, string) {
 		afwCommand(t, "ip", "-n", ns, "link", "set", "lo", "up")
 	}
 	for i, path := range []string{"a", "b"} {
-		afwCommand(t, "ip", "-n", server, "link", "add", path, "type", "veth", "peer", "name", path, "netns", client)
+		afwCommand(t, "ip", "-n", server, "link", "add", "name", path, "type", "veth", "peer", "name", path, "netns", client)
 		for host, ns := range []string{server, client} {
 			afwCommand(t, "ip", "-n", ns, "addr", "add", fmt.Sprintf("10.%d.0.%d/24", 206+i, host+1), "dev", path)
 			afwCommand(t, "ip", "-n", ns, "-6", "addr", "add", fmt.Sprintf("fd73:%d::%d/64", 206+i, host+1), "dev", path, "nodad")
-			afwCommand(t, "ip", "-n", ns, "link", "set", path, "up")
+			afwCommand(t, "ip", "-n", ns, "link", "set", "dev", path, "up")
 		}
 	}
 	afwCommand(t, "ip", "-n", server, "addr", "add", "10.209.0.1/32", "dev", "lo")
@@ -441,11 +441,11 @@ func afwSwitchPath(t *testing.T, ns, path, old string) {
 	if path == "b" {
 		network = 207
 	}
-	afwCommand(t, "ip", "-n", ns, "link", "set", path, "up")
+	afwCommand(t, "ip", "-n", ns, "link", "set", "dev", path, "up")
 	afwCommand(t, "ip", "-n", ns, "route", "replace", "10.209.0.1/32", "via", fmt.Sprintf("10.%d.0.1", network), "dev", path, "src", fmt.Sprintf("10.%d.0.2", network))
 	afwCommand(t, "ip", "-n", ns, "-6", "route", "replace", "fd73:209::1/128", "via", fmt.Sprintf("fd73:%d::1", network), "dev", path, "src", fmt.Sprintf("fd73:%d::2", network))
 	if old != "" {
-		afwCommand(t, "ip", "-n", ns, "link", "set", old, "down")
+		afwCommand(t, "ip", "-n", ns, "link", "set", "dev", old, "down")
 	}
 }
 
